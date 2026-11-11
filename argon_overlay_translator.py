@@ -28,10 +28,6 @@ if QApplication.instance() is None:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
-DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if os.path.exists(DEFAULT_TESSERACT):
-    pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT
-
 _EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 if (
     os.path.basename(_EXE_DIR).lower() == "dist"
@@ -40,6 +36,22 @@ if (
     APP_DIR = os.path.dirname(_EXE_DIR)
 else:
     APP_DIR = _EXE_DIR
+
+DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_TESSERACT_CANDIDATES = [
+    os.path.join(APP_DIR, "Tesseract-OCR", "tesseract.exe"),
+    DEFAULT_TESSERACT,
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR", "tesseract.exe"),
+]
+for _cand in _TESSERACT_CANDIDATES:
+    if _cand and os.path.exists(_cand):
+        pytesseract.pytesseract.tesseract_cmd = _cand
+        _tessdata_dir = os.path.join(os.path.dirname(_cand), "tessdata")
+        if os.path.isdir(_tessdata_dir):
+            os.environ["TESSDATA_PREFIX"] = _tessdata_dir
+        break
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CODEX_FILE = os.path.join(APP_DIR, "codex.json")

@@ -9,3 +9,5 @@ config.json
 codex.json
 translation_cache.json
 test_config_temp.json
+Tesseract-OCR/
+tesseract_setup.exe
