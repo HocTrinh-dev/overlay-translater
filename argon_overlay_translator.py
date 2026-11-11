@@ -18,7 +18,8 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QLineEdit, QSpinBox, QCheckBox, QFrame, QInputDialog
+    QLabel, QComboBox, QLineEdit, QSpinBox, QCheckBox, QFrame, QInputDialog,
+    QListView
 )
 
 # High-DPI synchronization for 125% / 150% / 4K Windows displays
@@ -414,12 +415,13 @@ DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/HocTrinh-dev/overlay-tra
 class MainStudioWindow(QWidget):
     def __init__(self, config_path=CONFIG_FILE):
         super().__init__()
+        self.setObjectName("MainStudio")
         self.config_path = config_path
         self.update_url = DEFAULT_UPDATE_URL
         self.auto_update_on_start = True
 
         self.setWindowTitle("Argon Context Overlay Translator")
-        self.setFixedSize(480, 520)
+        self.setMinimumWidth(520)
 
         self.overlay_hud = FloatingOverlayHUD()
         self.worker = None
@@ -435,6 +437,8 @@ class MainStudioWindow(QWidget):
 
         self._apply_stylesheet()
         self._build_ui()
+        self.adjustSize()
+        self.setFixedSize(self.sizeHint().width(), self.sizeHint().height())
         self.load_config()
         self._register_global_hotkeys()
 
@@ -443,10 +447,15 @@ class MainStudioWindow(QWidget):
     def _apply_stylesheet(self):
         self.setStyleSheet("""
             QWidget {
-                background-color: #0B0F19;
                 color: #F8FAFC;
                 font-family: 'Segoe UI', system-ui, sans-serif;
                 font-size: 13px;
+            }
+            QWidget#MainStudio {
+                background-color: #0B0F19;
+            }
+            QLabel, QCheckBox {
+                background-color: transparent;
             }
             QFrame#Card {
                 background-color: #111827;
@@ -478,12 +487,36 @@ class MainStudioWindow(QWidget):
                 background-color: #1E293B;
                 border: 1px solid #334155;
                 border-radius: 6px;
-                padding: 7px 10px;
+                padding: 5px 10px;
+                min-height: 24px;
                 color: #F8FAFC;
                 selection-background-color: #6366F1;
             }
             QComboBox:focus, QLineEdit:focus, QSpinBox:focus {
                 border: 1px solid #6366F1;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 26px;
+                border-left: 1px solid #334155;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+                background-color: #1E293B;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1E293B;
+                color: #F8FAFC;
+                border: 1px solid #475569;
+                selection-background-color: #6366F1;
+                selection-color: #FFFFFF;
+                outline: 0;
+                padding: 4px;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 28px;
+                padding: 4px 10px;
+                border-radius: 4px;
             }
             QPushButton#PrimaryBtn {
                 background-color: #6366F1;
@@ -493,6 +526,7 @@ class MainStudioWindow(QWidget):
                 font-weight: 700;
                 font-size: 13px;
                 padding: 11px 16px;
+                min-height: 22px;
             }
             QPushButton#PrimaryBtn:hover {
                 background-color: #4F46E5;
@@ -506,7 +540,8 @@ class MainStudioWindow(QWidget):
                 border: 1px solid #334155;
                 border-radius: 8px;
                 font-weight: 600;
-                padding: 9px 10px;
+                padding: 8px 12px;
+                min-height: 20px;
             }
             QPushButton#SecondaryBtn:hover {
                 background-color: #334155;
@@ -546,7 +581,7 @@ class MainStudioWindow(QWidget):
 
         header_row = QHBoxLayout()
         header_box = QVBoxLayout()
-        header_box.setSpacing(3)
+        header_box.setSpacing(4)
         lbl_title = QLabel("Argon Screen Translator")
         lbl_title.setObjectName("HeaderTitle")
         lbl_sub = QLabel("Real-time Context Overlay • Anti Self-OCR • Click-Through HUD")
@@ -565,18 +600,22 @@ class MainStudioWindow(QWidget):
         card_lang = QFrame()
         card_lang.setObjectName("Card")
         c1_layout = QVBoxLayout(card_lang)
-        c1_layout.setContentsMargins(14, 14, 14, 14)
-        c1_layout.setSpacing(10)
+        c1_layout.setContentsMargins(16, 14, 16, 16)
+        c1_layout.setSpacing(12)
 
         lbl_sec1 = QLabel("LANGUAGE & CAPTURE CONFIGURATION")
         lbl_sec1.setObjectName("SectionLabel")
         c1_layout.addWidget(lbl_sec1)
 
         row_lang = QHBoxLayout()
+        row_lang.setSpacing(12)
         col_src = QVBoxLayout()
+        col_src.setSpacing(6)
         lbl_s = QLabel("Source OCR Language:")
         lbl_s.setObjectName("FieldLabel")
         self.cb_src = QComboBox()
+        self.cb_src.setView(QListView())
+        self.cb_src.setFixedHeight(36)
         self.cb_src.addItems([
             "English (eng)",
             "Simplified Chinese (chi_sim)",
@@ -587,9 +626,12 @@ class MainStudioWindow(QWidget):
         col_src.addWidget(self.cb_src)
 
         col_dst = QVBoxLayout()
+        col_dst.setSpacing(6)
         lbl_d = QLabel("Target Overlay Language:")
         lbl_d.setObjectName("FieldLabel")
         self.cb_dst = QComboBox()
+        self.cb_dst.setView(QListView())
+        self.cb_dst.setFixedHeight(36)
         self.cb_dst.addItems(["Vietnamese", "English", "Japanese", "Korean", "French"])
         col_dst.addWidget(lbl_d)
         col_dst.addWidget(self.cb_dst)
@@ -599,9 +641,11 @@ class MainStudioWindow(QWidget):
         c1_layout.addLayout(row_lang)
 
         row_auto = QHBoxLayout()
-        self.chk_auto = QCheckBox("Auto-scan & translate every:")
+        self.chk_auto = QCheckBox("Auto-scan && translate every:")
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
         self.sp_interval = QSpinBox()
+        self.sp_interval.setFixedHeight(36)
+        self.sp_interval.setMinimumWidth(85)
         self.sp_interval.setRange(2, 30)
         self.sp_interval.setValue(3)
         self.sp_interval.setSuffix(" sec")
@@ -615,25 +659,30 @@ class MainStudioWindow(QWidget):
         card_ai = QFrame()
         card_ai.setObjectName("Card")
         c2_layout = QVBoxLayout(card_ai)
-        c2_layout.setContentsMargins(14, 14, 14, 14)
-        c2_layout.setSpacing(10)
+        c2_layout.setContentsMargins(16, 14, 16, 16)
+        c2_layout.setSpacing(12)
 
         lbl_sec2 = QLabel("AI CONTEXT ENGINE (OPTIONAL)")
         lbl_sec2.setObjectName("SectionLabel")
         c2_layout.addWidget(lbl_sec2)
 
         row_model = QHBoxLayout()
+        row_model.setSpacing(12)
         col_url = QVBoxLayout()
+        col_url.setSpacing(6)
         lbl_u = QLabel("API Endpoint:")
         lbl_u.setObjectName("FieldLabel")
         self.txt_url = QLineEdit("https://api.openai.com/v1/chat/completions")
+        self.txt_url.setFixedHeight(36)
         col_url.addWidget(lbl_u)
         col_url.addWidget(self.txt_url)
 
         col_m = QVBoxLayout()
+        col_m.setSpacing(6)
         lbl_m = QLabel("Model Name:")
         lbl_m.setObjectName("FieldLabel")
         self.txt_model = QLineEdit("gpt-4o-mini")
+        self.txt_model.setFixedHeight(36)
         col_m.addWidget(lbl_m)
         col_m.addWidget(self.txt_model)
 
@@ -641,17 +690,22 @@ class MainStudioWindow(QWidget):
         row_model.addLayout(col_m, 1)
         c2_layout.addLayout(row_model)
 
+        col_k = QVBoxLayout()
+        col_k.setSpacing(6)
         lbl_k = QLabel("API Key (Leave blank for free Google Translate fallback):")
         lbl_k.setObjectName("FieldLabel")
         self.txt_key = QLineEdit()
+        self.txt_key.setFixedHeight(36)
         self.txt_key.setEchoMode(QLineEdit.Password)
         self.txt_key.setPlaceholderText("sk-...")
-        c2_layout.addWidget(lbl_k)
-        c2_layout.addWidget(self.txt_key)
+        col_k.addWidget(lbl_k)
+        col_k.addWidget(self.txt_key)
+        c2_layout.addLayout(col_k)
 
         root.addWidget(card_ai)
 
         row_btns = QHBoxLayout()
+        row_btns.setSpacing(12)
         self.btn_lock = QPushButton("🔓 Click-Through Lock (F10)")
         self.btn_lock.setObjectName("SecondaryBtn")
         self.btn_lock.clicked.connect(self.toggle_lock_mode)
@@ -664,7 +718,7 @@ class MainStudioWindow(QWidget):
         row_btns.addWidget(self.btn_clear, 1)
         root.addLayout(row_btns)
 
-        self.btn_translate = QPushButton("⚡ Scan & Translate Selected Region (F9)")
+        self.btn_translate = QPushButton("⚡ Scan && Translate Selected Region (F9)")
         self.btn_translate.setObjectName("PrimaryBtn")
         self.btn_translate.clicked.connect(self.initiate_capture_and_translate)
         root.addWidget(self.btn_translate)

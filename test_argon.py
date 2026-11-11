@@ -128,6 +128,20 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         with open(target_script, "r", encoding="utf-8") as f:
             self.assertIn("# New version v2", f.read())
 
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_ui_dropdown_and_input_heights(self, mock_hotkey):
+        """Verify dropdowns and inputs have proper height (>= 36px) and QListView popup views."""
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        studio.show()
+        self.assertGreaterEqual(studio.cb_src.height(), 36)
+        self.assertGreaterEqual(studio.cb_dst.height(), 36)
+        self.assertGreaterEqual(studio.txt_url.height(), 36)
+        self.assertGreaterEqual(studio.txt_model.height(), 36)
+        self.assertGreaterEqual(studio.txt_key.height(), 36)
+        self.assertIsInstance(studio.cb_src.view(), aot.QListView)
+        self.assertIsInstance(studio.cb_dst.view(), aot.QListView)
+        studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
