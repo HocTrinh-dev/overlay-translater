@@ -184,6 +184,110 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertEqual(studio.overlay_hud.geometry(), snipped_rect)
         studio.close()
 
+    def test_codex_and_persistent_translation_cache(self):
+        """Verify Game Codex lookup, Names.txt import, Persistent Cache, Fuzzy OCR match, and Partial Batch AI skip."""
+        codex_path = os.path.join(self.temp_dir.name, "codex.json")
+        cache_path = os.path.join(self.temp_dir.name, "translation_cache.json")
+        names_file = os.path.join(self.temp_dir.name, "Names.txt")
+
+        with open(names_file, "w", encoding="utf-8") as f:
+            f.write("青云门=Thanh Vân Môn|Phe phái (Faction)|Môn phái chính đạo\n")
+
+        mgr = aot.TranslationKnowledgeManager(codex_path=codex_path, cache_path=cache_path)
+        self.assertEqual(len(mgr.codex_entries), 1)
+        self.assertEqual(mgr.lookup_cached_translation("青云门", "Vietnamese"), "Thanh Vân Môn")
+
+        # Add custom game codex entry with context note
+        mgr.add_or_update_codex(
+            "Crimson Blade",
+            "Huyết Kiếm",
+            "Vật phẩm (Item)",
+            "Thanh kiếm cổ của nhân vật chính, xưng Ta - Ngươi"
+        )
+        matched = mgr.find_relevant_codex_entries(["He wields the Crimson Blade in battle."])
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["target"], "Huyết Kiếm")
+
+        # Store cached translation and verify both Exact Match and Fuzzy OCR Match
+        mgr.store_cached_translations(
+            ["Press F to interact with the ancient shrine."],
+            ["Nhấn F để tương tác với ngôi đền cổ."],
+            "Vietnamese"
+        )
+        # Exact match
+        self.assertEqual(
+            mgr.lookup_cached_translation("Press F to interact with the ancient shrine.", "Vietnamese"),
+            "Nhấn F để tương tác với ngôi đền cổ."
+        )
+        # Fuzzy OCR jitter match (e.g., OCR read 'shrine!' instead of 'shrine.')
+        self.assertEqual(
+            mgr.lookup_cached_translation("Press F to interact with the ancient shrine!", "Vietnamese"),
+            "Nhấn F để tương tác với ngôi đền cổ."
+        )
+
+        # Partial Batch Translation: 2 cached/codex lines + 1 brand-new line -> AI only receives 1 line!
+        dummy_img = Image.new("RGB", (200, 80), color=(0, 0, 0))
+        worker = aot.TranslationWorker(
+            pil_img=dummy_img,
+            tess_lang="eng",
+            target_lang="Vietnamese",
+            api_url="https://api.openai.com/v1/chat/completions",
+            api_key="sk-mock",
+            model_name="gpt-4o-mini",
+            last_raw_text="",
+            knowledge_mgr=mgr
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '["Anh ấy vung Huyết Kiếm trong trận chiến."]'}}]
+        }
+        with patch("argon_overlay_translator.requests.post", return_value=mock_resp) as mock_post:
+            batch = [
+                "青云门",
+                "Press F to interact with the ancient shrine.",
+                "He wields the Crimson Blade in battle."
+            ]
+            translations, cache_hits = worker.resolve_with_cache_and_translate(batch)
+            self.assertEqual(cache_hits, 2)
+            self.assertEqual(
+                translations,
+                [
+                    "Thanh Vân Môn",
+                    "Nhấn F để tương tác với ngôi đền cổ.",
+                    "Anh ấy vung Huyết Kiếm trong trận chiến."
+                ]
+            )
+            # Ensure only the 1 uncached line was sent to the LLM API, and Codex term was injected into prompt
+            mock_post.assert_called_once()
+            sent_payload = mock_post.call_args.kwargs["json"]
+            self.assertEqual(json.loads(sent_payload["messages"][1]["content"]), ["He wields the Crimson Blade in battle."])
+            self.assertIn("Huyết Kiếm", sent_payload["messages"][0]["content"])
+
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_codex_and_cache_dialog_live_overlay_update(self, mock_hotkey):
+        """Verify editing a translation in CodexAndCacheDialog immediately updates visible HUD blocks."""
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        studio.knowledge_mgr.store_cached_translations(["Game Over"], ["Trò chơi kết thúc"], "Vietnamese")
+        studio.overlay_hud.blocks = [
+            {"rect": (10, 10, 120, 30), "text": "Trò chơi kết thúc", "raw": "Game Over", "raw_line": "Game Over"}
+        ]
+
+        studio.open_codex_and_cache_dialog()
+        dlg = studio.codex_dialog
+        self.assertIsNotNone(dlg)
+        self.assertEqual(dlg.tbl_cache.rowCount(), 1)
+
+        # Edit cached translation via dialog and verify live overlay HUD block updates immediately
+        dlg.txt_cache_edit_src.setText("Game Over")
+        dlg.txt_cache_edit_dst.setText("Bạn đã bại trận")
+        dlg.txt_cache_edit_lang = "Vietnamese"
+        dlg.save_edited_cache_entry()
+
+        self.assertEqual(studio.overlay_hud.blocks[0]["text"], "Bạn đã bại trận")
+        studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

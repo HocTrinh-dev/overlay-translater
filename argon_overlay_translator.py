@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import time
+import difflib
 import threading
 import subprocess
 import requests
@@ -19,7 +20,8 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QCheckBox, QFrame, QInputDialog,
-    QListView
+    QListView, QDialog, QTabWidget, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QFileDialog, QMessageBox
 )
 
 # High-DPI synchronization for 125% / 150% / 4K Windows displays
@@ -40,6 +42,8 @@ else:
     APP_DIR = _EXE_DIR
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+CODEX_FILE = os.path.join(APP_DIR, "codex.json")
+CACHE_FILE = os.path.join(APP_DIR, "translation_cache.json")
 MAIN_SCRIPT_FILE = os.path.join(APP_DIR, "argon_overlay_translator.py")
 
 STARTUP_SCRIPT_SNAPSHOT = ""
@@ -56,10 +60,8 @@ def normalize_github_raw_url(url: str) -> str:
     url = url.strip()
     if not url:
         return ""
-    # Convert https://github.com/user/repo/blob/branch/path -> https://raw.githubusercontent.com/user/repo/branch/path
     if "github.com/" in url and "/blob/" in url:
         return url.replace("github.com/", "raw.githubusercontent.com/").replace("/blob/", "/")
-    # Convert https://github.com/user/repo -> https://raw.githubusercontent.com/user/repo/main/argon_overlay_translator.py
     if "github.com/" in url and "raw.githubusercontent.com" not in url:
         clean = url.rstrip("/")
         if clean.endswith(".git"):
@@ -72,13 +74,340 @@ def normalize_github_raw_url(url: str) -> str:
 
 
 # =====================================================================
+# 0. GAME CODEX (ENCYCLOPEDIA) & PERSISTENT TRANSLATION CACHE ENGINE
+# =====================================================================
+GAME_STYLE_PRESETS = [
+    "Tự động (Auto Context)",
+    "Tiên hiệp / Kiếm hiệp (Cổ trang Hán Việt, xưng hô Ta - Ngươi / Huynh - Đệ)",
+    "Dark Fantasy / Souls-like (Văn phong cổ điển, trang trọng, huyền bí)",
+    "Anime / JRPG (Tự nhiên, cảm xúc, xưng hô Tớ - Cậu / Anh - Em)",
+    "Sci-Fi / Cyberpunk (Hiện đại, công nghệ, thuật ngữ ngắn gọn)"
+]
+
+
+class TranslationKnowledgeManager:
+    """
+    Thread-safe local knowledge base combining:
+    1. Game Encyclopedia / Codex (`codex.json` + `Names.txt` hybrid) for lookup & prompt injection.
+    2. Persistent LRU + Fuzzy OCR Translation Memory (`translation_cache.json`) to avoid redundant AI calls.
+    3. Sliding-window recent dialogue context for cross-frame narrative continuity.
+    """
+
+    def __init__(self, codex_path=CODEX_FILE, cache_path=CACHE_FILE, max_cache_size=5000):
+        self.codex_path = codex_path
+        self.cache_path = cache_path
+        self.max_cache_size = max_cache_size
+        self.lock = threading.RLock()
+
+        self.game_style = GAME_STYLE_PRESETS[0]
+        self.codex_entries = []  # list of {"source": str, "target": str, "category": str, "note": str}
+        self.cache_data = {}     # {target_lang: {norm_key: {"source": str, "target": str, "hits": int, "updated_at": float}}}
+        self.recent_dialogue = []  # list of (source_line, translated_line)
+
+        self.load()
+
+    @staticmethod
+    def normalize_key(text: str) -> str:
+        return " ".join(text.strip().split())
+
+    def load(self):
+        with self.lock:
+            if os.path.exists(self.codex_path):
+                try:
+                    with open(self.codex_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        self.game_style = data.get("game_style", GAME_STYLE_PRESETS[0])
+                        self.codex_entries = data.get("entries", [])
+                except Exception as e:
+                    print(f"Codex load warning: {e}")
+
+            # Auto-import Names.txt or glossary.txt if present and codex is empty
+            if not self.codex_entries:
+                for fname in ("Names.txt", "glossary.txt"):
+                    fpath = os.path.join(os.path.dirname(self.codex_path), fname)
+                    if os.path.exists(fpath):
+                        self.import_names_file(fpath, save_after=False)
+
+            if os.path.exists(self.cache_path):
+                try:
+                    with open(self.cache_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        self.cache_data = data
+                except Exception as e:
+                    print(f"Translation cache load warning: {e}")
+
+    def save_codex(self):
+        with self.lock:
+            try:
+                payload = {
+                    "game_style": self.game_style,
+                    "entries": self.codex_entries
+                }
+                with open(self.codex_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Codex save warning: {e}")
+
+    def save_cache(self):
+        with self.lock:
+            try:
+                with open(self.cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self.cache_data, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Cache save warning: {e}")
+
+    def add_or_update_codex(self, source: str, target: str, category: str = "Thuật ngữ (Lore)", note: str = ""):
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            return
+        with self.lock:
+            for item in self.codex_entries:
+                if item["source"].lower() == source.lower():
+                    item["source"] = source
+                    item["target"] = target
+                    item["category"] = category.strip() or "Thuật ngữ (Lore)"
+                    item["note"] = note.strip()
+                    self.save_codex()
+                    return
+            self.codex_entries.append({
+                "source": source,
+                "target": target,
+                "category": category.strip() or "Thuật ngữ (Lore)",
+                "note": note.strip()
+            })
+            self.save_codex()
+
+    def delete_codex(self, source: str):
+        source_lower = source.strip().lower()
+        with self.lock:
+            self.codex_entries = [
+                e for e in self.codex_entries if e["source"].lower() != source_lower
+            ]
+            self.save_codex()
+
+    def import_names_file(self, filepath: str, save_after: bool = True) -> int:
+        count = 0
+        if not os.path.exists(filepath):
+            return 0
+        with self.lock:
+            existing_map = {e["source"].lower(): e for e in self.codex_entries}
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#") or line.startswith("//"):
+                            continue
+                        sep = "=" if "=" in line else ("\t" if "\t" in line else None)
+                        if not sep:
+                            continue
+                        src, rest = line.split(sep, 1)
+                        src = src.strip()
+                        parts = [p.strip() for p in rest.split("|")]
+                        tgt = parts[0].split("/")[0].strip() if parts else ""
+                        cat = parts[1] if len(parts) > 1 else "Tên riêng (Names.txt)"
+                        note = parts[2] if len(parts) > 2 else ""
+                        if src and tgt:
+                            existing_map[src.lower()] = {
+                                "source": src,
+                                "target": tgt,
+                                "category": cat,
+                                "note": note
+                            }
+                            count += 1
+                self.codex_entries = list(existing_map.values())
+                if save_after and count > 0:
+                    self.save_codex()
+            except Exception as e:
+                print(f"Import Names.txt warning: {e}")
+        return count
+
+    def search_codex(self, query: str = "") -> list:
+        q = query.strip().lower()
+        with self.lock:
+            if not q:
+                return list(self.codex_entries)
+            return [
+                e for e in self.codex_entries
+                if q in e["source"].lower()
+                or q in e["target"].lower()
+                or q in e.get("category", "").lower()
+                or q in e.get("note", "").lower()
+            ]
+
+    def find_relevant_codex_entries(self, text_lines: list) -> list:
+        joined_lower = "\n".join(text_lines).lower()
+        with self.lock:
+            matched = [
+                e for e in self.codex_entries
+                if e["source"] and e["source"].lower() in joined_lower
+            ]
+            # Sort by longest source term first (Longest-Match priority)
+            matched.sort(key=lambda x: len(x["source"]), reverse=True)
+            return matched
+
+    def apply_codex_replacements(self, text: str) -> str:
+        """Apply Longest-Match dictionary replacement for fallback translators."""
+        with self.lock:
+            sorted_entries = sorted(self.codex_entries, key=lambda x: len(x["source"]), reverse=True)
+            result = text
+            for e in sorted_entries:
+                src, tgt = e["source"], e["target"]
+                if src and src in result:
+                    result = result.replace(src, tgt)
+            return result
+
+    def lookup_cached_translation(self, raw_line: str, target_lang: str, fuzzy_threshold: float = 0.92):
+        norm_key = self.normalize_key(raw_line)
+        if not norm_key:
+            return raw_line
+
+        with self.lock:
+            # 1. Direct exact match in Codex (e.g., character name, skill name, menu button)
+            norm_lower = norm_key.lower()
+            for entry in self.codex_entries:
+                if entry["source"].strip().lower() == norm_lower:
+                    return entry["target"]
+
+            lang_bucket = self.cache_data.get(target_lang, {})
+            # 2. Exact match in persistent cache
+            if norm_key in lang_bucket:
+                record = lang_bucket[norm_key]
+                record["hits"] = record.get("hits", 1) + 1
+                record["updated_at"] = time.time()
+                return record["target"]
+
+            # 3. Fuzzy match for minor OCR jitter on lines >= 8 chars
+            if len(norm_key) >= 8 and lang_bucket:
+                best_ratio = 0.0
+                best_record = None
+                key_len = len(norm_key)
+                for cached_key, record in lang_bucket.items():
+                    if abs(len(cached_key) - key_len) > 3:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, norm_key, cached_key).ratio()
+                    if ratio >= fuzzy_threshold and ratio > best_ratio:
+                        best_ratio = ratio
+                        best_record = record
+                if best_record is not None:
+                    best_record["hits"] = best_record.get("hits", 1) + 1
+                    best_record["updated_at"] = time.time()
+                    return best_record["target"]
+
+        return None
+
+    def store_cached_translations(self, source_lines: list, translated_lines: list, target_lang: str):
+        with self.lock:
+            lang_bucket = self.cache_data.setdefault(target_lang, {})
+            now = time.time()
+            for src, tgt in zip(source_lines, translated_lines):
+                norm_key = self.normalize_key(src)
+                if not norm_key or not tgt or not tgt.strip():
+                    continue
+                if norm_key in lang_bucket:
+                    lang_bucket[norm_key]["target"] = tgt.strip()
+                    lang_bucket[norm_key]["updated_at"] = now
+                else:
+                    lang_bucket[norm_key] = {
+                        "source": src.strip(),
+                        "target": tgt.strip(),
+                        "hits": 1,
+                        "updated_at": now
+                    }
+
+            # Enforce LRU capacity
+            if len(lang_bucket) > self.max_cache_size:
+                sorted_keys = sorted(
+                    lang_bucket.keys(),
+                    key=lambda k: lang_bucket[k].get("updated_at", 0.0)
+                )
+                for old_key in sorted_keys[: len(lang_bucket) - self.max_cache_size]:
+                    del lang_bucket[old_key]
+
+            self.save_cache()
+
+    def update_single_cache_entry(self, source_line: str, new_target: str, target_lang: str):
+        norm_key = self.normalize_key(source_line)
+        if not norm_key or not new_target.strip():
+            return
+        with self.lock:
+            lang_bucket = self.cache_data.setdefault(target_lang, {})
+            existing_hits = lang_bucket.get(norm_key, {}).get("hits", 1)
+            lang_bucket[norm_key] = {
+                "source": source_line.strip(),
+                "target": new_target.strip(),
+                "hits": existing_hits,
+                "updated_at": time.time()
+            }
+            self.save_cache()
+
+    def delete_cache_entry(self, source_line: str, target_lang: str):
+        norm_key = self.normalize_key(source_line)
+        with self.lock:
+            lang_bucket = self.cache_data.get(target_lang, {})
+            if norm_key in lang_bucket:
+                del lang_bucket[norm_key]
+                self.save_cache()
+
+    def clear_all_cache(self):
+        with self.lock:
+            self.cache_data = {}
+            self.save_cache()
+
+    def list_cache_entries(self, query: str = "") -> list:
+        q = query.strip().lower()
+        rows = []
+        with self.lock:
+            for lang, bucket in self.cache_data.items():
+                for norm_key, rec in bucket.items():
+                    src = rec.get("source", norm_key)
+                    tgt = rec.get("target", "")
+                    if not q or q in src.lower() or q in tgt.lower() or q in lang.lower():
+                        rows.append({
+                            "source": src,
+                            "target": tgt,
+                            "lang": lang,
+                            "hits": rec.get("hits", 1),
+                            "updated_at": rec.get("updated_at", 0.0)
+                        })
+        rows.sort(key=lambda r: r["updated_at"], reverse=True)
+        return rows
+
+    def record_dialogue(self, source_lines: list, translated_lines: list):
+        with self.lock:
+            for s, t in zip(source_lines, translated_lines):
+                if s.strip() and t.strip():
+                    self.recent_dialogue.append((s.strip(), t.strip()))
+            self.recent_dialogue = self.recent_dialogue[-5:]
+
+    def get_recent_dialogue_prompt(self) -> str:
+        with self.lock:
+            if not self.recent_dialogue:
+                return ""
+            lines = [f"- {s} => {t}" for s, t in self.recent_dialogue[-4:]]
+            return "\n".join(lines)
+
+
+# =====================================================================
 # 1. BACKGROUND WORKER: OCR & BATCH CONTEXTUAL TRANSLATION (QTHREAD)
 # =====================================================================
 class TranslationWorker(QThread):
     finished_signal = pyqtSignal(object, str)  # (list_of_blocks_or_None, status_message)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, pil_img, tess_lang, target_lang, api_url, api_key, model_name, last_raw_text):
+    def __init__(
+        self,
+        pil_img,
+        tess_lang,
+        target_lang,
+        api_url,
+        api_key,
+        model_name,
+        last_raw_text,
+        knowledge_mgr: TranslationKnowledgeManager = None
+    ):
         super().__init__()
         self.pil_img = pil_img
         self.tess_lang = tess_lang
@@ -87,6 +416,7 @@ class TranslationWorker(QThread):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip()
         self.last_raw_text = last_raw_text
+        self.knowledge_mgr = knowledge_mgr
 
     def run(self):
         try:
@@ -142,7 +472,7 @@ class TranslationWorker(QThread):
             return
 
         raw_list = [entry['raw_text'] for entry in line_entries]
-        translated_list = self.translate_batch_with_context(raw_list)
+        translated_list, cache_hits = self.resolve_with_cache_and_translate(raw_list)
 
         overlay_blocks = []
         for idx, entry in enumerate(line_entries):
@@ -150,11 +480,71 @@ class TranslationWorker(QThread):
             overlay_blocks.append({
                 'rect': entry['rect'],
                 'text': trans_text,
-                'raw': combined_raw
+                'raw': combined_raw,
+                'raw_line': entry['raw_text']
             })
 
         timestamp = time.strftime('%H:%M:%S')
-        self.finished_signal.emit(overlay_blocks, f"Translated {len(overlay_blocks)} lines at {timestamp}")
+        ai_calls = len(raw_list) - cache_hits
+        self.finished_signal.emit(
+            overlay_blocks,
+            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Cache: {cache_hits}/{len(raw_list)} • AI mới: {ai_calls})"
+        )
+
+    def resolve_with_cache_and_translate(self, text_lines: list):
+        """Check local Cache/Codex first; only send uncached lines to AI/Google, then persist new translations."""
+        if not self.knowledge_mgr:
+            return self.translate_batch_with_context(text_lines), 0
+
+        final_translations = [None] * len(text_lines)
+        missing_indices = []
+        missing_lines = []
+        cache_hits = 0
+
+        for idx, line in enumerate(text_lines):
+            cached = self.knowledge_mgr.lookup_cached_translation(line, self.target_lang)
+            if cached is not None:
+                final_translations[idx] = cached
+                cache_hits += 1
+            else:
+                missing_indices.append(idx)
+                missing_lines.append(line)
+
+        if missing_lines:
+            newly_translated = self.translate_batch_with_context(missing_lines)
+            for i, orig_idx in enumerate(missing_indices):
+                trans = newly_translated[i] if i < len(newly_translated) else missing_lines[i]
+                final_translations[orig_idx] = trans
+
+            self.knowledge_mgr.store_cached_translations(
+                missing_lines,
+                [final_translations[i] for i in missing_indices],
+                self.target_lang
+            )
+
+        self.knowledge_mgr.record_dialogue(text_lines, final_translations)
+        return final_translations, cache_hits
+
+    def _build_codex_context_block(self, text_lines: list) -> str:
+        if not self.knowledge_mgr:
+            return ""
+        parts = []
+        if self.knowledge_mgr.game_style and self.knowledge_mgr.game_style != GAME_STYLE_PRESETS[0]:
+            parts.append(f"Game Genre & Pronoun Style: {self.knowledge_mgr.game_style}")
+
+        matched_codex = self.knowledge_mgr.find_relevant_codex_entries(text_lines)
+        if matched_codex:
+            glossary_lines = []
+            for e in matched_codex[:30]:
+                note_str = f" ({e['category']} - {e['note']})" if e.get("note") else f" ({e.get('category', '')})"
+                glossary_lines.append(f"- \"{e['source']}\" MUST be translated as \"{e['target']}\"{note_str}")
+            parts.append("Mandatory Game Codex / Glossary Terms:\n" + "\n".join(glossary_lines))
+
+        recent = self.knowledge_mgr.get_recent_dialogue_prompt()
+        if recent:
+            parts.append("Recent Preceding Game Dialogue (for pronoun/context continuity):\n" + recent)
+
+        return "\n\n".join(parts)
 
     def translate_batch_with_context(self, text_lines):
         if self.api_key:
@@ -163,10 +553,13 @@ class TranslationWorker(QThread):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 }
+                codex_block = self._build_codex_context_block(text_lines)
+                extra_instructions = f"\n\n{codex_block}\n" if codex_block else ""
                 system_prompt = (
-                    f"You are an expert context-aware translator. "
+                    f"You are an expert game & application context-aware translator. "
                     f"Receive a JSON array of text lines captured from a screen. "
-                    f"Understand the full context across all lines, then translate each line naturally into {self.target_lang}. "
+                    f"Understand the full context across all lines, then translate each line naturally into {self.target_lang}."
+                    f"{extra_instructions}"
                     f"Return ONLY a valid JSON array of strings with the exact same number of elements ({len(text_lines)})."
                 )
                 payload = {
@@ -187,11 +580,15 @@ class TranslationWorker(QThread):
             except Exception as e:
                 print(f"LLM API Warning (falling back to Google Translate): {e}")
 
-        # Free Fallback via Google Translate GTX endpoint
+        # Free Fallback via Google Translate GTX endpoint (with Codex pre-replacement)
         try:
+            prepared_lines = [
+                self.knowledge_mgr.apply_codex_replacements(line) if self.knowledge_mgr else line
+                for line in text_lines
+            ]
             tl_map = {"Vietnamese": "vi", "English": "en", "Japanese": "ja", "Korean": "ko", "French": "fr"}
             tl = tl_map.get(self.target_lang, "vi")
-            joined_query = "\n".join(text_lines)
+            joined_query = "\n".join(prepared_lines)
             url = (
                 f"https://translate.googleapis.com/translate_a/single?client=gtx"
                 f"&sl=auto&tl={tl}&dt=t&q={requests.utils.quote(joined_query)}"
@@ -522,6 +919,387 @@ class RegionSnipperOverlay(QWidget):
 
 
 # =====================================================================
+# 2C. GAME CODEX (ENCYCLOPEDIA) & TRANSLATION CACHE STUDIO DIALOG
+# =====================================================================
+class CodexAndCacheDialog(QDialog):
+    knowledge_updated = pyqtSignal()
+
+    def __init__(self, knowledge_mgr: TranslationKnowledgeManager, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CodexDialog")
+        self.knowledge_mgr = knowledge_mgr
+        self.setWindowTitle("📚 Bách Khoa Toàn Thư Game & Kho Lưu Bản Dịch (Codex & Cache)")
+        self.resize(820, 560)
+        self._apply_dialog_stylesheet()
+        self._build_dialog_ui()
+        self.refresh_codex_table()
+        self.refresh_cache_table()
+
+    def _apply_dialog_stylesheet(self):
+        self.setStyleSheet("""
+            QDialog#CodexDialog {
+                background-color: #0B0F19;
+                color: #F8FAFC;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+                font-size: 13px;
+            }
+            QLabel {
+                background-color: transparent;
+                color: #CBD5E1;
+                font-weight: 600;
+            }
+            QTabWidget::pane {
+                border: 1px solid #1F2937;
+                background-color: #111827;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                background-color: #1E293B;
+                color: #94A3B8;
+                padding: 9px 18px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                font-weight: 700;
+            }
+            QTabBar::tab:selected {
+                background-color: #6366F1;
+                color: #FFFFFF;
+            }
+            QTableWidget {
+                background-color: #0F172A;
+                alternate-background-color: #111827;
+                color: #F8FAFC;
+                border: 1px solid #1E293B;
+                border-radius: 6px;
+                gridline-color: #1E293B;
+                selection-background-color: #4F46E5;
+                selection-color: #FFFFFF;
+            }
+            QHeaderView::section {
+                background-color: #1E293B;
+                color: #818CF8;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 6px 8px;
+                border: none;
+                border-bottom: 1px solid #334155;
+            }
+            QLineEdit, QComboBox {
+                background-color: #1E293B;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 5px 10px;
+                min-height: 24px;
+                color: #F8FAFC;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #6366F1;
+            }
+            QPushButton#ActionBtn {
+                background-color: #6366F1;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                font-weight: 700;
+                padding: 7px 14px;
+                min-height: 22px;
+            }
+            QPushButton#ActionBtn:hover {
+                background-color: #4F46E5;
+            }
+            QPushButton#SubBtn {
+                background-color: #1E293B;
+                color: #E2E8F0;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                font-weight: 600;
+                padding: 7px 12px;
+                min-height: 22px;
+            }
+            QPushButton#SubBtn:hover {
+                background-color: #334155;
+            }
+        """)
+
+    def _build_dialog_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+
+        # ==================== TAB 1: GAME CODEX (ENCYCLOPEDIA) ====================
+        tab_codex = QWidget()
+        l_codex = QVBoxLayout(tab_codex)
+        l_codex.setContentsMargins(14, 14, 14, 14)
+        l_codex.setSpacing(10)
+
+        row_style = QHBoxLayout()
+        lbl_style = QLabel("🎮 Bối cảnh / Văn phong Game:")
+        self.cb_style = QComboBox()
+        self.cb_style.setView(QListView())
+        self.cb_style.setFixedHeight(34)
+        self.cb_style.addItems(GAME_STYLE_PRESETS)
+        idx_style = self.cb_style.findText(self.knowledge_mgr.game_style)
+        if idx_style >= 0:
+            self.cb_style.setCurrentIndex(idx_style)
+        self.cb_style.currentTextChanged.connect(self._on_style_changed)
+        row_style.addWidget(lbl_style)
+        row_style.addWidget(self.cb_style, 1)
+        l_codex.addLayout(row_style)
+
+        row_search_codex = QHBoxLayout()
+        self.txt_codex_search = QLineEdit()
+        self.txt_codex_search.setFixedHeight(34)
+        self.txt_codex_search.setPlaceholderText(
+            "🔍 Tra cứu nhanh tên nhân vật, chiêu thức, vật phẩm, địa danh hoặc cốt truyện..."
+        )
+        self.txt_codex_search.textChanged.connect(self.refresh_codex_table)
+        row_search_codex.addWidget(self.txt_codex_search, 1)
+
+        btn_import = QPushButton("📂 Nhập Names.txt / Glossary")
+        btn_import.setObjectName("SubBtn")
+        btn_import.clicked.connect(self.import_glossary_dialog)
+        row_search_codex.addWidget(btn_import)
+        l_codex.addLayout(row_search_codex)
+
+        self.tbl_codex = QTableWidget(0, 4)
+        self.tbl_codex.setHorizontalHeaderLabels([
+            "Từ gốc (Source)",
+            "Bản dịch chuẩn (Target)",
+            "Phân loại (Category)",
+            "Ghi chú Ngữ cảnh & Xưng hô (Lore / Pronouns)"
+        ])
+        self.tbl_codex.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.tbl_codex.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.tbl_codex.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tbl_codex.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.tbl_codex.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_codex.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_codex.itemSelectionChanged.connect(self._on_codex_row_selected)
+        l_codex.addWidget(self.tbl_codex, 1)
+
+        # Add / Edit Form
+        form_row1 = QHBoxLayout()
+        self.txt_c_src = QLineEdit()
+        self.txt_c_src.setFixedHeight(34)
+        self.txt_c_src.setPlaceholderText("Từ gốc (VD: Crimson Blade / 青云门)")
+
+        self.txt_c_dst = QLineEdit()
+        self.txt_c_dst.setFixedHeight(34)
+        self.txt_c_dst.setPlaceholderText("Bản dịch chuẩn (VD: Huyết Kiếm / Thanh Vân Môn)")
+
+        self.cb_c_cat = QComboBox()
+        self.cb_c_cat.setView(QListView())
+        self.cb_c_cat.setFixedHeight(34)
+        self.cb_c_cat.addItems([
+            "Nhân vật (Character)",
+            "Kỹ năng (Skill)",
+            "Vật phẩm (Item)",
+            "Địa danh (Location)",
+            "Phe phái (Faction)",
+            "Thuật ngữ (Lore)"
+        ])
+
+        form_row1.addWidget(self.txt_c_src, 2)
+        form_row1.addWidget(self.txt_c_dst, 2)
+        form_row1.addWidget(self.cb_c_cat, 1)
+        l_codex.addLayout(form_row1)
+
+        form_row2 = QHBoxLayout()
+        self.txt_c_note = QLineEdit()
+        self.txt_c_note.setFixedHeight(34)
+        self.txt_c_note.setPlaceholderText(
+            "Ghi chú tra cứu & xưng hô (VD: Sư phụ của main, xưng 'Bổn tọa - Ngươi', sát thương băng...)"
+        )
+
+        btn_save_codex = QPushButton("➕ Lưu vào Bách Khoa")
+        btn_save_codex.setObjectName("ActionBtn")
+        btn_save_codex.clicked.connect(self.save_codex_entry)
+
+        btn_del_codex = QPushButton("🗑️ Xóa mục chọn")
+        btn_del_codex.setObjectName("SubBtn")
+        btn_del_codex.clicked.connect(self.delete_selected_codex)
+
+        form_row2.addWidget(self.txt_c_note, 1)
+        form_row2.addWidget(btn_save_codex)
+        form_row2.addWidget(btn_del_codex)
+        l_codex.addLayout(form_row2)
+
+        self.tabs.addTab(tab_codex, "📚 Bách Khoa Toàn Thư (Game Codex)")
+
+        # ==================== TAB 2: PERSISTENT TRANSLATION CACHE ====================
+        tab_cache = QWidget()
+        l_cache = QVBoxLayout(tab_cache)
+        l_cache.setContentsMargins(14, 14, 14, 14)
+        l_cache.setSpacing(10)
+
+        row_search_cache = QHBoxLayout()
+        self.txt_cache_search = QLineEdit()
+        self.txt_cache_search.setFixedHeight(34)
+        self.txt_cache_search.setPlaceholderText("🔍 Tìm kiếm câu thoại gốc hoặc câu đã dịch trong bộ nhớ máy...")
+        self.txt_cache_search.textChanged.connect(self.refresh_cache_table)
+        self.lbl_cache_stats = QLabel("Đã lưu: 0 câu")
+        row_search_cache.addWidget(self.txt_cache_search, 1)
+        row_search_cache.addWidget(self.lbl_cache_stats)
+        l_cache.addLayout(row_search_cache)
+
+        self.tbl_cache = QTableWidget(0, 4)
+        self.tbl_cache.setHorizontalHeaderLabels([
+            "Câu gốc (OCR Source)",
+            "Bản dịch đã lưu (Cached Translation)",
+            "Ngôn ngữ",
+            "Lượt tái sử dụng"
+        ])
+        self.tbl_cache.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl_cache.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tbl_cache.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tbl_cache.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.tbl_cache.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_cache.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_cache.itemSelectionChanged.connect(self._on_cache_row_selected)
+        l_cache.addWidget(self.tbl_cache, 1)
+
+        edit_cache_row = QHBoxLayout()
+        self.txt_cache_edit_src = QLineEdit()
+        self.txt_cache_edit_src.setFixedHeight(34)
+        self.txt_cache_edit_src.setPlaceholderText("Câu gốc...")
+        self.txt_cache_edit_dst = QLineEdit()
+        self.txt_cache_edit_dst.setFixedHeight(34)
+        self.txt_cache_edit_dst.setPlaceholderText("Chỉnh sửa lại bản dịch tại đây để dùng vĩnh viễn...")
+        self.txt_cache_edit_lang = "Vietnamese"
+
+        btn_update_cache = QPushButton("✏️ Lưu sửa bản dịch")
+        btn_update_cache.setObjectName("ActionBtn")
+        btn_update_cache.clicked.connect(self.save_edited_cache_entry)
+
+        btn_del_cache = QPushButton("🗑️ Xóa câu chọn")
+        btn_del_cache.setObjectName("SubBtn")
+        btn_del_cache.clicked.connect(self.delete_selected_cache_entry)
+
+        btn_clear_cache = QPushButton("🧹 Xóa sạch Cache")
+        btn_clear_cache.setObjectName("SubBtn")
+        btn_clear_cache.clicked.connect(self.clear_all_cache_entries)
+
+        edit_cache_row.addWidget(self.txt_cache_edit_src, 2)
+        edit_cache_row.addWidget(self.txt_cache_edit_dst, 3)
+        edit_cache_row.addWidget(btn_update_cache)
+        edit_cache_row.addWidget(btn_del_cache)
+        edit_cache_row.addWidget(btn_clear_cache)
+        l_cache.addLayout(edit_cache_row)
+
+        self.tabs.addTab(tab_cache, "💾 Bộ Nhớ Đã Dịch (Translation Cache)")
+
+    def _on_style_changed(self, new_style: str):
+        self.knowledge_mgr.game_style = new_style
+        self.knowledge_mgr.save_codex()
+
+    def refresh_codex_table(self):
+        entries = self.knowledge_mgr.search_codex(self.txt_codex_search.text())
+        self.tbl_codex.setRowCount(len(entries))
+        for r, item in enumerate(entries):
+            self.tbl_codex.setItem(r, 0, QTableWidgetItem(item.get("source", "")))
+            self.tbl_codex.setItem(r, 1, QTableWidgetItem(item.get("target", "")))
+            self.tbl_codex.setItem(r, 2, QTableWidgetItem(item.get("category", "")))
+            self.tbl_codex.setItem(r, 3, QTableWidgetItem(item.get("note", "")))
+
+    def _on_codex_row_selected(self):
+        row = self.tbl_codex.currentRow()
+        if row < 0:
+            return
+        self.txt_c_src.setText(self.tbl_codex.item(row, 0).text())
+        self.txt_c_dst.setText(self.tbl_codex.item(row, 1).text())
+        cat_txt = self.tbl_codex.item(row, 2).text()
+        idx = self.cb_c_cat.findText(cat_txt)
+        if idx >= 0:
+            self.cb_c_cat.setCurrentIndex(idx)
+        self.txt_c_note.setText(self.tbl_codex.item(row, 3).text())
+
+    def save_codex_entry(self):
+        src = self.txt_c_src.text().strip()
+        dst = self.txt_c_dst.text().strip()
+        if not src or not dst:
+            return
+        self.knowledge_mgr.add_or_update_codex(
+            src, dst, self.cb_c_cat.currentText(), self.txt_c_note.text().strip()
+        )
+        self.txt_c_src.clear()
+        self.txt_c_dst.clear()
+        self.txt_c_note.clear()
+        self.refresh_codex_table()
+        self.knowledge_updated.emit()
+
+    def delete_selected_codex(self):
+        row = self.tbl_codex.currentRow()
+        if row < 0:
+            return
+        src = self.tbl_codex.item(row, 0).text()
+        self.knowledge_mgr.delete_codex(src)
+        self.refresh_codex_table()
+        self.knowledge_updated.emit()
+
+    def import_glossary_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file Names.txt hoặc Glossary.txt (định dạng: Từ_gốc=Bản_dịch)",
+            APP_DIR,
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if path:
+            imported = self.knowledge_mgr.import_names_file(path)
+            self.refresh_codex_table()
+            self.knowledge_updated.emit()
+            QMessageBox.information(
+                self,
+                "Nhập Bách Khoa Toàn Thư",
+                f"Đã nhập thành công {imported} thuật ngữ vào Bách Khoa Toàn Thư!"
+            )
+
+    def refresh_cache_table(self):
+        rows = self.knowledge_mgr.list_cache_entries(self.txt_cache_search.text())
+        total_hits = sum(r.get("hits", 1) for r in rows)
+        self.lbl_cache_stats.setText(f"Đã lưu: {len(rows)} câu • Tổng lượt dùng: {total_hits}")
+        self.tbl_cache.setRowCount(len(rows))
+        for r, item in enumerate(rows):
+            self.tbl_cache.setItem(r, 0, QTableWidgetItem(item["source"]))
+            self.tbl_cache.setItem(r, 1, QTableWidgetItem(item["target"]))
+            self.tbl_cache.setItem(r, 2, QTableWidgetItem(item["lang"]))
+            self.tbl_cache.setItem(r, 3, QTableWidgetItem(str(item["hits"])))
+
+    def _on_cache_row_selected(self):
+        row = self.tbl_cache.currentRow()
+        if row < 0:
+            return
+        self.txt_cache_edit_src.setText(self.tbl_cache.item(row, 0).text())
+        self.txt_cache_edit_dst.setText(self.tbl_cache.item(row, 1).text())
+        self.txt_cache_edit_lang = self.tbl_cache.item(row, 2).text() or "Vietnamese"
+
+    def save_edited_cache_entry(self):
+        src = self.txt_cache_edit_src.text().strip()
+        dst = self.txt_cache_edit_dst.text().strip()
+        if not src or not dst:
+            return
+        self.knowledge_mgr.update_single_cache_entry(src, dst, self.txt_cache_edit_lang)
+        self.refresh_cache_table()
+        self.knowledge_updated.emit()
+
+    def delete_selected_cache_entry(self):
+        row = self.tbl_cache.currentRow()
+        if row < 0:
+            return
+        src = self.tbl_cache.item(row, 0).text()
+        lang = self.tbl_cache.item(row, 2).text()
+        self.knowledge_mgr.delete_cache_entry(src, lang)
+        self.refresh_cache_table()
+
+    def clear_all_cache_entries(self):
+        self.knowledge_mgr.clear_all_cache()
+        self.refresh_cache_table()
+
+
+# =====================================================================
 # 3. MAIN CONTROL STUDIO WINDOW (HIGH-CRAFT DARK UI)
 # =====================================================================
 class HotkeyBridge(QObject):
@@ -535,20 +1313,29 @@ DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/HocTrinh-dev/overlay-tra
 
 
 class MainStudioWindow(QWidget):
-    def __init__(self, config_path=CONFIG_FILE):
+    def __init__(self, config_path=CONFIG_FILE, codex_path=None, cache_path=None):
         super().__init__()
         self.setObjectName("MainStudio")
         self.config_path = config_path
+        base_dir = os.path.dirname(os.path.abspath(config_path))
+        self.codex_path = codex_path or os.path.join(base_dir, "codex.json")
+        self.cache_path = cache_path or os.path.join(base_dir, "translation_cache.json")
+        self.knowledge_mgr = TranslationKnowledgeManager(
+            codex_path=self.codex_path,
+            cache_path=self.cache_path
+        )
+
         self.update_url = DEFAULT_UPDATE_URL
         self.auto_update_on_start = True
         self.saved_region_rect = QRect(350, 280, 560, 220)
 
         self.setWindowTitle("Argon Context Overlay Translator")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
 
         self.overlay_hud = FloatingOverlayHUD()
         self.snipper = RegionSnipperOverlay()
         self.snipper.region_selected.connect(self._on_region_snipped)
+        self.codex_dialog = None
 
         self.worker = None
         self.update_worker = None
@@ -711,7 +1498,7 @@ class MainStudioWindow(QWidget):
         header_box.setSpacing(4)
         lbl_title = QLabel("Argon Screen Translator")
         lbl_title.setObjectName("HeaderTitle")
-        lbl_sub = QLabel("Real-time Context Overlay • Anti Self-OCR • Click-Through HUD")
+        lbl_sub = QLabel("Real-time Context Overlay • Game Codex • Persistent Cache")
         lbl_sub.setObjectName("SubTitle")
         header_box.addWidget(lbl_title)
         header_box.addWidget(lbl_sub)
@@ -861,16 +1648,22 @@ class MainStudioWindow(QWidget):
         root.addWidget(card_ai)
 
         row_btns = QHBoxLayout()
-        row_btns.setSpacing(12)
-        self.btn_lock = QPushButton("🔓 Click-Through Lock (F10)")
+        row_btns.setSpacing(10)
+        self.btn_lock = QPushButton("🔓 Lock (F10)")
         self.btn_lock.setObjectName("SecondaryBtn")
         self.btn_lock.clicked.connect(self.toggle_lock_mode)
+
+        self.btn_codex = QPushButton("📚 Bách Khoa && Kho Dịch")
+        self.btn_codex.setObjectName("SecondaryBtn")
+        self.btn_codex.setToolTip("Mở Bách Khoa Toàn Thư Game (Codex) & Bộ Nhớ Câu Đã Dịch (Cache)")
+        self.btn_codex.clicked.connect(self.open_codex_and_cache_dialog)
 
         self.btn_clear = QPushButton("Clear Overlay")
         self.btn_clear.setObjectName("SecondaryBtn")
         self.btn_clear.clicked.connect(self.clear_overlay_text)
 
         row_btns.addWidget(self.btn_lock, 1)
+        row_btns.addWidget(self.btn_codex, 1)
         row_btns.addWidget(self.btn_clear, 1)
         root.addLayout(row_btns)
 
@@ -879,9 +1672,37 @@ class MainStudioWindow(QWidget):
         self.btn_translate.clicked.connect(self.initiate_capture_and_translate)
         root.addWidget(self.btn_translate)
 
-        self.lbl_status = QLabel("Ready • F8: Kéo chọn khung • F9: Dịch • F10: Khóa xuyên chuột")
+        self.lbl_status = QLabel("Ready • F8: Chọn khung • F9: Dịch • F10: Khóa • 📚 Bách Khoa & Cache")
         self.lbl_status.setObjectName("StatusPill")
         root.addWidget(self.lbl_status)
+
+    def open_codex_and_cache_dialog(self):
+        if self.codex_dialog is None:
+            self.codex_dialog = CodexAndCacheDialog(self.knowledge_mgr, self)
+            self.codex_dialog.knowledge_updated.connect(self._on_knowledge_updated)
+        else:
+            self.codex_dialog.refresh_codex_table()
+            self.codex_dialog.refresh_cache_table()
+        self.codex_dialog.show()
+        self.codex_dialog.raise_()
+        self.codex_dialog.activateWindow()
+
+    def _on_knowledge_updated(self):
+        # Immediately apply updated cache/codex translations to currently visible HUD pills
+        if not self.overlay_hud.blocks:
+            return
+        target_lang = self.cb_dst.currentText()
+        changed = False
+        for b in self.overlay_hud.blocks:
+            raw_line = b.get("raw_line", "")
+            if raw_line:
+                updated = self.knowledge_mgr.lookup_cached_translation(raw_line, target_lang)
+                if updated and updated != b["text"]:
+                    b["text"] = updated
+                    changed = True
+        if changed:
+            self.overlay_hud.update()
+            self.lbl_status.setText("✓ Đã cập nhật trực tiếp bản dịch mới lên màn hình Overlay!")
 
     def on_capture_mode_changed(self, index: int):
         self.clear_overlay_text()
@@ -894,7 +1715,7 @@ class MainStudioWindow(QWidget):
             self.overlay_hud.is_fullscreen = True
             self.overlay_hud.setGeometry(full_geo)
             self.overlay_hud.set_locked(True)
-            self.btn_lock.setText("🔒 Locked Click-Through (F10)")
+            self.btn_lock.setText("🔒 Locked (F10)")
             self.btn_translate.setText("⚡ Scan && Translate Full Screen (F9)")
             self.lbl_status.setText("🖥️ Chế độ Toàn màn hình: Bấm F9 để dịch toàn bộ màn hình.")
         else:
@@ -903,7 +1724,7 @@ class MainStudioWindow(QWidget):
             if self.saved_region_rect and self.saved_region_rect.width() >= 140:
                 self.overlay_hud.setGeometry(self.saved_region_rect)
             self.overlay_hud.set_locked(False)
-            self.btn_lock.setText("🔓 Click-Through Lock (F10)")
+            self.btn_lock.setText("🔓 Lock (F10)")
             self.btn_translate.setText("⚡ Scan && Translate Selected Region (F9)")
             self.lbl_status.setText("🔲 Chế độ Khung HUD: Kéo/chỉnh khung hoặc bấm F8 để quét vùng mới.")
 
@@ -922,7 +1743,7 @@ class MainStudioWindow(QWidget):
         self.overlay_hud.is_fullscreen = False
         self.overlay_hud.setGeometry(rect)
         self.overlay_hud.set_locked(False)
-        self.btn_lock.setText("🔓 Click-Through Lock (F10)")
+        self.btn_lock.setText("🔓 Lock (F10)")
         self.btn_translate.setText("⚡ Scan && Translate Selected Region (F9)")
         self.overlay_hud.show()
         self.overlay_hud.update()
@@ -1078,10 +1899,10 @@ class MainStudioWindow(QWidget):
         new_state = not self.overlay_hud.is_locked
         self.overlay_hud.set_locked(new_state)
         if new_state:
-            self.btn_lock.setText("🔒 Locked Click-Through (F10)")
+            self.btn_lock.setText("🔒 Locked (F10)")
             self.lbl_status.setText("HUD Locked: Mouse clicks now pass through to underlying window.")
         else:
-            self.btn_lock.setText("🔓 Click-Through Lock (F10)")
+            self.btn_lock.setText("🔓 Lock (F10)")
             self.lbl_status.setText("HUD Unlocked: You can drag or resize the capture box.")
 
     def clear_overlay_text(self):
@@ -1146,7 +1967,7 @@ class MainStudioWindow(QWidget):
         tess_lang = lang_map[self.cb_src.currentIndex()]
         target_lang = self.cb_dst.currentText()
 
-        self.lbl_status.setText("⏳ Running OCR & contextual batch translation...")
+        self.lbl_status.setText("⏳ Đang OCR & tra cứu Bách Khoa / Cache...")
         self.worker = TranslationWorker(
             pil_img=pil_img,
             tess_lang=tess_lang,
@@ -1154,7 +1975,8 @@ class MainStudioWindow(QWidget):
             api_url=self.txt_url.text(),
             api_key=self.txt_key.text(),
             model_name=self.txt_model.text(),
-            last_raw_text=self.last_raw_text
+            last_raw_text=self.last_raw_text,
+            knowledge_mgr=self.knowledge_mgr
         )
         self.worker.finished_signal.connect(self._on_translation_done)
         self.worker.error_signal.connect(self._on_translation_error)
@@ -1173,6 +1995,8 @@ class MainStudioWindow(QWidget):
 
     def closeEvent(self, event):
         self.save_config()
+        if self.codex_dialog:
+            self.codex_dialog.close()
         self.snipper.close()
         self.overlay_hud.close()
         event.accept()
