@@ -2,7 +2,6 @@ import sys
 import os
 import json
 import time
-import difflib
 import threading
 import subprocess
 import requests
@@ -259,7 +258,26 @@ class TranslationKnowledgeManager:
                     result = result.replace(src, tgt)
             return result
 
-    def lookup_cached_translation(self, raw_line: str, target_lang: str, fuzzy_threshold: float = 0.92):
+    @staticmethod
+    def _text_similarity(a: str, b: str) -> float:
+        """Pure-Python normalized Levenshtein similarity (0.0 to 1.0) without external/stdlib imports."""
+        if a == b:
+            return 1.0
+        la, lb = len(a), len(b)
+        if la == 0 or lb == 0:
+            return 0.0
+        prev = list(range(lb + 1))
+        for i in range(1, la + 1):
+            curr = [i] + [0] * lb
+            ca = a[i - 1]
+            for j in range(1, lb + 1):
+                cost = 0 if ca == b[j - 1] else 1
+                curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            prev = curr
+        max_len = la if la >= lb else lb
+        return 1.0 - (prev[lb] / max_len)
+
+    def lookup_cached_translation(self, raw_line: str, target_lang: str, fuzzy_threshold: float = 0.90):
         norm_key = self.normalize_key(raw_line)
         if not norm_key:
             return raw_line
@@ -287,7 +305,7 @@ class TranslationKnowledgeManager:
                 for cached_key, record in lang_bucket.items():
                     if abs(len(cached_key) - key_len) > 3:
                         continue
-                    ratio = difflib.SequenceMatcher(None, norm_key, cached_key).ratio()
+                    ratio = self._text_similarity(norm_key, cached_key)
                     if ratio >= fuzzy_threshold and ratio > best_ratio:
                         best_ratio = ratio
                         best_record = record

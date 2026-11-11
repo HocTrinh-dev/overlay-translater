@@ -287,6 +287,33 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertEqual(studio.overlay_hud.blocks[0]["text"], "Bạn đã bại trận")
         studio.close()
 
+    def test_no_unbundled_imports_for_frozen_launcher(self):
+        """Ensure argon_overlay_translator.py only imports modules bundled in launcher.py (.exe compatibility)."""
+        import ast
+        with open(aot.MAIN_SCRIPT_FILE, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        allowed_top_modules = {
+            "sys", "os", "json", "time", "threading", "subprocess", "runpy", "shutil",
+            "requests", "PIL", "mss", "pytesseract", "keyboard", "PyQt5"
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top_mod = alias.name.split(".")[0]
+                    self.assertIn(
+                        top_mod,
+                        allowed_top_modules,
+                        f"Module '{top_mod}' is not bundled in ArgonTranslator.exe launcher.py!"
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top_mod = node.module.split(".")[0]
+                self.assertIn(
+                    top_mod,
+                    allowed_top_modules,
+                    f"Module '{top_mod}' is not bundled in ArgonTranslator.exe launcher.py!"
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
