@@ -1626,9 +1626,28 @@ class HotUpdateWorker(QThread):
 # =====================================================================
 # 2. FLOATING HUD OVERLAY WINDOW (DRAGGABLE, RESIZABLE, CLICK-THROUGH)
 # =====================================================================
+def set_window_capture_exclusion(widget) -> bool:
+    """
+    Make `widget` invisible to screen capture (mss/BitBlt) via SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)
+    on Windows 10 2004+, so Auto mode can watch the screen continuously WITHOUT hiding/blinking the overlay.
+    ctypes is already loaded by `keyboard`/`mss` on Windows (and bundled in the .exe), so we reuse it from sys.modules.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        ctypes_mod = sys.modules.get("ctypes") or __import__("ctypes")
+        hwnd = int(widget.winId())
+        if not hwnd:
+            return False
+        return bool(ctypes_mod.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011))
+    except Exception:
+        return False
+
+
 class FloatingOverlayHUD(QWidget):
     MIN_HUD_W = 100
     MIN_HUD_H = 44
+    ANIM_DURATION = 0.26  # seconds for smooth chat slide / fade animation
 
     def __init__(self):
         super().__init__()
@@ -1650,6 +1669,15 @@ class FloatingOverlayHUD(QWidget):
         self.auto_font_fit = True
         self.text_color_mode = "auto"  # "auto" or hex color string e.g. "#FFFFFF", "#FACC15"
         self.bg_opacity = 95           # 0..100 (%)
+        self.capture_excluded = False  # True when HUD is invisible to screen capture (no-blink Auto mode)
+
+        # Smooth chat animation state (slide old lines to new positions, fade-in new lines, fade-out removed lines)
+        self.fading_blocks = []
+        self.anim_progress = 1.0
+        self.anim_start_time = 0.0
+        self.anim_timer = QTimer(self)
+        self.anim_timer.setInterval(16)
+        self.anim_timer.timeout.connect(self._on_anim_tick)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -1661,6 +1689,71 @@ class FloatingOverlayHUD(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setGeometry(350, 280, 560, 220)
         self.setMouseTracking(True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # setWindowFlags() recreates the native window, so re-apply capture exclusion every time we are shown
+        self.capture_excluded = set_window_capture_exclusion(self)
+
+    # ---------------------- Smooth chat animation ----------------------
+    def set_blocks_animated(self, new_blocks: list):
+        """
+        Replace blocks with a smooth transition instead of clear-and-redraw:
+        - Lines that already exist (same raw_line) slide from their old Y to their new Y (chat scrolling up).
+        - Brand-new lines fade in with a small slide-up.
+        - Lines that disappeared fade out while drifting up.
+        """
+        new_blocks = list(new_blocks or [])
+        old_blocks = [b for b in self.blocks if 'rect' in b]
+        dpr = self.dpr or 1.0
+        used_old = set()
+
+        for nb in new_blocks:
+            n_raw = nb.get('raw_line', '')
+            n_y = nb['rect'][1]
+            best_idx, best_dist = None, None
+            if n_raw:
+                for oi, ob in enumerate(old_blocks):
+                    if oi in used_old:
+                        continue
+                    o_raw = ob.get('raw_line', '')
+                    if o_raw and is_same_ocr_data(n_raw, o_raw):
+                        dist = abs(ob['rect'][1] - n_y)
+                        if best_dist is None or dist < best_dist:
+                            best_idx, best_dist = oi, dist
+            if best_idx is not None:
+                used_old.add(best_idx)
+                nb['_anim_dy'] = (old_blocks[best_idx]['rect'][1] - n_y) / dpr
+                nb['_anim_alpha0'] = 1.0
+            else:
+                nb['_anim_dy'] = 10.0 if old_blocks else 0.0
+                nb['_anim_alpha0'] = 0.0
+
+        self.fading_blocks = []
+        for oi, ob in enumerate(old_blocks):
+            if oi not in used_old:
+                fb = dict(ob)
+                fb['_fade_out'] = True
+                self.fading_blocks.append(fb)
+
+        self.blocks = new_blocks
+        self.anim_progress = 0.0
+        self.anim_start_time = time.time()
+        if not self.anim_timer.isActive():
+            self.anim_timer.start()
+        self.update()
+
+    def _on_anim_tick(self):
+        elapsed = time.time() - self.anim_start_time
+        self.anim_progress = min(1.0, elapsed / self.ANIM_DURATION)
+        if self.anim_progress >= 1.0:
+            self.anim_timer.stop()
+            self.fading_blocks = []
+        self.update()
+
+    def _anim_eased(self) -> float:
+        p = max(0.0, min(1.0, self.anim_progress))
+        return 1.0 - (1.0 - p) ** 3  # ease-out cubic
 
     def set_locked(self, locked: bool):
         self.is_locked = locked
@@ -1793,11 +1886,16 @@ class FloatingOverlayHUD(QWidget):
         mask_alpha = max(0, min(255, int(self.bg_opacity * 255 / 100)))
 
         # Sort blocks top-to-bottom so multi-line chat boxes never overlap or paint backgrounds over text
-        sorted_blocks = sorted(self.blocks, key=lambda item: (item['rect'][1], item['rect'][0]))
+        eased = self._anim_eased()
         render_plan = []
-        n_blocks = len(sorted_blocks)
+        layout_groups = (
+            (sorted(self.blocks, key=lambda item: (item['rect'][1], item['rect'][0])), False),
+            (sorted(self.fading_blocks, key=lambda item: (item['rect'][1], item['rect'][0])), True),
+        )
 
-        for idx, b in enumerate(sorted_blocks):
+        for sorted_blocks, is_fading in layout_groups:
+          n_blocks = len(sorted_blocks)
+          for idx, b in enumerate(sorted_blocks):
             rx, ry, rw, rh = b['rect']
             lx = int(rx / self.dpr)
             ly = int(ry / self.dpr)
@@ -1807,6 +1905,15 @@ class FloatingOverlayHUD(QWidget):
             text = b['text']
             bg_rgb = b.get('bg_color', (15, 23, 42))
             fg_rgb = b.get('fg_color', (248, 250, 252))
+
+            # Animation: live lines slide from old Y (+fade in if new); removed lines fade out drifting up
+            if is_fading:
+                anim_dy = -10.0 * eased
+                anim_alpha = 1.0 - eased
+            else:
+                anim_dy = float(b.get('_anim_dy', 0.0)) * (1.0 - eased)
+                a0 = float(b.get('_anim_alpha0', 1.0))
+                anim_alpha = a0 + (1.0 - a0) * eased
 
             # Check vertical slot before the next chat line below this block
             next_ly = None
@@ -1850,12 +1957,13 @@ class FloatingOverlayHUD(QWidget):
             if next_ly is not None and ly + draw_h > next_ly:
                 draw_h = max(14, next_ly - ly)
 
-            b['painted_phys_rect'] = (
-                max(0, int((lx - 2) * self.dpr)),
-                max(0, int((ly - 1) * self.dpr)),
-                int((draw_w + 4) * self.dpr),
-                int((draw_h + 2) * self.dpr)
-            )
+            if not is_fading:
+                b['painted_phys_rect'] = (
+                    max(0, int((lx - 2) * self.dpr)),
+                    max(0, int((ly - 1) * self.dpr)),
+                    int((draw_w + 4) * self.dpr),
+                    int((draw_h + 2) * self.dpr)
+                )
             render_plan.append({
                 'block': b,
                 'lx': lx,
@@ -1868,6 +1976,9 @@ class FloatingOverlayHUD(QWidget):
                 'bg_rgb': bg_rgb,
                 'fg_rgb': fg_rgb,
                 'font': font,
+                'dy': anim_dy,
+                'alpha': max(0.0, min(1.0, anim_alpha)),
+                'is_fading': is_fading,
             })
 
         # PASS 1: Draw all background masks / pills FIRST so no background ever covers adjacent line text!
@@ -1881,6 +1992,11 @@ class FloatingOverlayHUD(QWidget):
                 bg_rgb = item['bg_rgb']
 
                 if self.overlay_style == "replace":
+                    # Chameleon masks stay fixed at the REAL text position (the game already scrolled the chat),
+                    # so original foreign text is hidden instantly while the translated text slides smoothly.
+                    if item['is_fading']:
+                        continue
+                    painter.setOpacity(1.0)
                     painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], mask_alpha)))
                     painter.drawRoundedRect(
                         QRectF(lx - 2, ly - 1, max(orig_lw, draw_w) + 4, max(orig_lh, draw_h) + 1),
@@ -1900,25 +2016,31 @@ class FloatingOverlayHUD(QWidget):
                             2, 2
                         )
                 elif self.overlay_style == "glass":
-                    bg_rect = QRectF(lx - 3, ly - 1, draw_w + 6, draw_h + 1)
+                    painter.setOpacity(item['alpha'])
+                    bg_rect = QRectF(lx - 3, ly - 1 + item['dy'], draw_w + 6, draw_h + 1)
                     painter.setBrush(QBrush(QColor(11, 15, 25, mask_alpha)))
                     painter.drawRoundedRect(bg_rect, 4, 4)
+            painter.setOpacity(1.0)
 
         # PASS 2: Draw all translated text ON TOP of all backgrounds
         mode_key = self.overlay_style if self.overlay_style in ("replace", "transparent") else "glass"
         for item in render_plan:
+            if item['alpha'] <= 0.01:
+                continue
+            painter.setOpacity(item['alpha'])
             painter.setFont(item['font'])
             fg_qcolor, outline_qcolor = self._resolve_colors_for_block(
                 item['bg_rgb'], item['fg_rgb'], mode_key
             )
             self._draw_outlined_text(
                 painter,
-                QRectF(item['lx'], item['ly'] - 1, item['draw_w'], item['draw_h'] + 2),
+                QRectF(item['lx'], item['ly'] - 1 + item['dy'], item['draw_w'], item['draw_h'] + 2),
                 Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
                 item['text'],
                 fg_qcolor,
                 outline_qcolor
             )
+        painter.setOpacity(1.0)
 
     def _hit_test_resize_edge(self, pos: QPoint) -> str:
         """
@@ -2601,6 +2723,13 @@ class MainStudioWindow(QWidget):
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self._on_auto_timer_tick)
 
+        # Event-driven Auto mode: continuous no-blink change watcher (only OCR when on-screen text changes)
+        self.last_ocr_text_sig = None
+        self.prev_watch_sig = None
+        self.change_pending_since = None
+        self.change_watch_timer = QTimer(self)
+        self.change_watch_timer.timeout.connect(self._on_change_watch_tick)
+
         self.scene_watch_timer = QTimer(self)
         self.scene_watch_timer.setInterval(260)
         self.scene_watch_timer.timeout.connect(self._check_scene_or_tab_change)
@@ -2614,6 +2743,8 @@ class MainStudioWindow(QWidget):
         self.scene_watch_timer.start()
 
         self.overlay_hud.show()
+        if self.chk_auto.isChecked():
+            self.toggle_auto_timer(Qt.Checked)
 
     def _apply_stylesheet(self):
         self.setStyleSheet("""
@@ -2964,7 +3095,11 @@ class MainStudioWindow(QWidget):
         c1_layout.addLayout(row_typo2)
 
         row_auto = QHBoxLayout()
-        self.chk_auto = QCheckBox("Auto-scan every:")
+        self.chk_auto = QCheckBox("⚡ Auto (dịch khi chữ thay đổi)")
+        self.chk_auto.setToolTip(
+            "Theo dõi màn hình liên tục không nháy, chỉ OCR & dịch khi nội dung chữ thay đổi.\n"
+            "Ô số giây chỉ dùng làm chế độ dự phòng trên Windows cũ không hỗ trợ theo dõi không nháy."
+        )
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
         self.sp_interval = QSpinBox()
         self.sp_interval.setFixedHeight(36)
@@ -3388,6 +3523,7 @@ class MainStudioWindow(QWidget):
                 new_cls = reload_ns.get("MainStudioWindow")
                 if new_cls is not None:
                     self.auto_timer.stop()
+                    self.change_watch_timer.stop()
                     self.scene_watch_timer.stop()
                     try:
                         keyboard.unhook_all()
@@ -3513,14 +3649,88 @@ class MainStudioWindow(QWidget):
         self.lbl_status.setText("🧹 Đã tự xóa Overlay do chuyển Tab / đổi nội dung màn hình.")
 
     def toggle_auto_timer(self, state):
+        self.auto_timer.stop()
+        watch_timer = getattr(self, "change_watch_timer", None)
+        if watch_timer is not None:
+            watch_timer.stop()
+        self.last_ocr_text_sig = None
+        self.prev_watch_sig = None
+        self.change_pending_since = None
+
         if state == Qt.Checked:
-            self.auto_timer.start(self.sp_interval.value() * 1000)
-            self.lbl_status.setText(f"Auto-scan active (chỉ dịch khi có dữ liệu mới • {self.sp_interval.value()}s)...")
-            if self.last_frame_sig is None:
-                QTimer.singleShot(50, self._on_auto_timer_tick)
+            if watch_timer is not None and self.overlay_hud.capture_excluded:
+                # Event-driven: watch the screen continuously (every 220ms, no blink) and only OCR when content changes
+                watch_timer.start(220)
+                self.lbl_status.setText("⚡ Auto: Đang theo dõi liên tục — chỉ dịch khi chữ trên màn hình thay đổi.")
+                QTimer.singleShot(50, self._on_change_watch_tick)
+            else:
+                # Fallback for Windows < 10 (2004): overlay cannot be excluded from capture -> interval scanning
+                self.auto_timer.start(self.sp_interval.value() * 1000)
+                self.lbl_status.setText(
+                    f"Auto-scan (dự phòng mỗi {self.sp_interval.value()}s — Windows này không hỗ trợ theo dõi không nháy)..."
+                )
+                if self.last_frame_sig is None:
+                    QTimer.singleShot(50, self._on_auto_timer_tick)
         else:
-            self.auto_timer.stop()
             self.lbl_status.setText("Auto-scan disabled.")
+
+    @staticmethod
+    def compute_text_signature(pil_img) -> tuple:
+        """
+        Fine-grained 96x48 grayscale signature: sensitive enough to detect a single new chat line,
+        cheap enough (~1ms) to run continuously every 220ms.
+        """
+        thumb = pil_img.convert("L").resize((96, 48), Image.BILINEAR)
+        return tuple(thumb.tobytes())
+
+    def _on_change_watch_tick(self):
+        """
+        Continuous event-driven watcher (HUD is excluded from capture, so grabbing never blinks the overlay):
+        1. Grab the clean HUD region and compute a fine text signature.
+        2. If it differs from the signature at the last OCR -> content changed.
+        3. Debounce: wait until the chat stops scrolling (2 consecutive similar frames) or max 0.9s of
+           continuous motion, then OCR once. Unchanged lines are reused instantly, only new lines are translated.
+        """
+        if (
+            not self.chk_auto.isChecked()
+            or (self.worker and self.worker.isRunning())
+            or self.overlay_hud.is_capturing
+            or self.overlay_hud.is_hidden_by_user
+            or self.overlay_hud.resizing
+            or self.overlay_hud.drag_offset is not None
+        ):
+            return
+
+        if not self.overlay_hud.capture_excluded:
+            # Exclusion lost (e.g. window recreated on an unsupported system) -> fall back to interval mode
+            self.change_watch_timer.stop()
+            self.auto_timer.start(self.sp_interval.value() * 1000)
+            return
+
+        pil_img = self._grab_raw_hud_image()
+        if pil_img is None:
+            return
+        sig = self.compute_text_signature(pil_img)
+        now = time.time()
+
+        if self.last_ocr_text_sig is None or len(self.last_ocr_text_sig) != len(sig):
+            self._start_translation_worker(pil_img, sig)
+            return
+
+        if self.frame_signature_diff(sig, self.last_ocr_text_sig) < 1.4:
+            self.change_pending_since = None
+            self.prev_watch_sig = sig
+            return
+
+        if self.change_pending_since is None:
+            self.change_pending_since = now
+        stable = (
+            self.prev_watch_sig is not None
+            and self.frame_signature_diff(sig, self.prev_watch_sig) < 0.9
+        )
+        self.prev_watch_sig = sig
+        if stable or (now - self.change_pending_since) >= 0.9:
+            self._start_translation_worker(pil_img, sig)
 
     @staticmethod
     def compute_frame_signature(pil_img) -> tuple:
@@ -3716,7 +3926,11 @@ class MainStudioWindow(QWidget):
                 return
             if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 22.0:
                 self.on_scene_or_tab_changed()
-        elif self.chk_auto.isChecked() and self.last_frame_sig is not None:
+        elif (
+            self.chk_auto.isChecked()
+            and self.last_frame_sig is not None
+            and not self.change_watch_timer.isActive()
+        ):
             raw_img = self._grab_raw_hud_image()
             if raw_img is not None:
                 new_sig = self.compute_frame_signature(raw_img)
@@ -3788,12 +4002,24 @@ class MainStudioWindow(QWidget):
             self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ không đổi (Bỏ qua OCR & giữ nguyên bản dịch)")
             return
         self.last_frame_sig = new_sig
+        self._start_translation_worker(pil_img, None)
+
+    def _start_translation_worker(self, pil_img, text_sig=None):
+        """Start background OCR + translation on a clean screenshot (old lines reused, only new lines translated)."""
+        if self.worker and self.worker.isRunning():
+            return
+        self.last_captured_pil_img = pil_img
+        if self.overlay_hud.blocks:
+            self.last_valid_blocks = list(self.overlay_hud.blocks)
+        self.last_ocr_text_sig = text_sig if text_sig is not None else self.compute_text_signature(pil_img)
+        self.prev_watch_sig = self.last_ocr_text_sig
+        self.change_pending_since = None
 
         src_selection = self.cb_src.currentText()
         tess_lang = resolve_ocr_lang_string(src_selection)
         target_lang = self.cb_dst.currentText()
 
-        self.lbl_status.setText("⏳ Đang OCR & kiểm tra dữ liệu mới...")
+        self.lbl_status.setText("⏳ Phát hiện thay đổi • Đang OCR & dịch dòng mới...")
         self.worker = TranslationWorker(
             pil_img=pil_img,
             tess_lang=tess_lang,
@@ -3819,7 +4045,8 @@ class MainStudioWindow(QWidget):
                 self.overlay_hud.repaint()
                 QTimer.singleShot(60, self._refresh_active_scene_signature)
         else:
-            self.overlay_hud.blocks = blocks
+            # Smooth transition: old chat lines slide to their new positions, new lines fade in, gone lines fade out
+            self.overlay_hud.set_blocks_animated(blocks)
             if blocks:
                 self.last_valid_blocks = list(blocks)
                 self.last_raw_text = blocks[0]['raw']
@@ -3842,6 +4069,7 @@ class MainStudioWindow(QWidget):
 
     def closeEvent(self, event):
         self.auto_timer.stop()
+        self.change_watch_timer.stop()
         self.scene_watch_timer.stop()
         self.save_config()
         if self.codex_dialog:

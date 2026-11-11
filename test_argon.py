@@ -747,6 +747,61 @@ class TestArgonOverlayTranslator(unittest.TestCase):
 
             studio.close()
 
+    def test_event_driven_auto_and_smooth_chat_animation(self):
+        """Verify Auto mode only OCRs when screen text changes (debounced) and chat lines slide/fade smoothly."""
+        from PIL import Image, ImageDraw
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = os.path.join(tmpdir, "event_auto_config.json")
+            studio = aot.MainStudioWindow(config_path=cfg_path)
+            hud = studio.overlay_hud
+            hud.dpr = 1.0
+
+            # 1. Smooth animation: existing line slides from old Y to new Y, new line fades in, removed line fades out
+            hud.blocks = [
+                {"text": "Dòng A", "rect": (10, 40, 100, 18), "raw_line": "Line Alpha here"},
+                {"text": "Dòng B", "rect": (10, 60, 100, 18), "raw_line": "Line Bravo here"},
+            ]
+            new_blocks = [
+                {"text": "Dòng B", "rect": (10, 40, 100, 18), "raw_line": "Line Bravo here"},
+                {"text": "Dòng C", "rect": (10, 60, 100, 18), "raw_line": "Something totally new"},
+            ]
+            hud.set_blocks_animated(new_blocks)
+            self.assertEqual(hud.blocks[0]["_anim_dy"], 20.0)       # B slides up from y=60 to y=40
+            self.assertEqual(hud.blocks[0]["_anim_alpha0"], 1.0)
+            self.assertEqual(hud.blocks[1]["_anim_alpha0"], 0.0)    # C fades in
+            self.assertEqual(len(hud.fading_blocks), 1)             # A fades out
+            self.assertEqual(hud.fading_blocks[0]["raw_line"], "Line Alpha here")
+            self.assertTrue(hud.anim_timer.isActive())
+            hud.anim_start_time -= 1.0
+            hud._on_anim_tick()
+            self.assertEqual(hud.anim_progress, 1.0)
+            self.assertEqual(hud.fading_blocks, [])
+            self.assertFalse(hud.anim_timer.isActive())
+
+            # 2. Event-driven watcher: no OCR when unchanged, debounce while chat scrolls, OCR once when stable
+            hud.capture_excluded = True
+            studio.chk_auto.blockSignals(True)
+            studio.chk_auto.setChecked(True)
+            studio.chk_auto.blockSignals(False)
+            img1 = Image.new("RGB", (240, 120), (20, 24, 32))
+            img2 = img1.copy()
+            ImageDraw.Draw(img2).rectangle([10, 80, 200, 110], fill=(240, 240, 240))
+            studio.last_ocr_text_sig = studio.compute_text_signature(img1)
+            studio.prev_watch_sig = studio.last_ocr_text_sig
+
+            with unittest.mock.patch.object(studio, "_grab_raw_hud_image", return_value=img1), \
+                 unittest.mock.patch.object(studio, "_start_translation_worker") as mock_start:
+                studio._on_change_watch_tick()
+                mock_start.assert_not_called()
+
+            with unittest.mock.patch.object(studio, "_grab_raw_hud_image", return_value=img2), \
+                 unittest.mock.patch.object(studio, "_start_translation_worker") as mock_start:
+                studio._on_change_watch_tick()   # first changed frame -> wait (debounce)
+                mock_start.assert_not_called()
+                studio._on_change_watch_tick()   # same changed frame again -> stable -> OCR once
+                mock_start.assert_called_once()
+            studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
