@@ -236,15 +236,15 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
     """
     Ensure `tesseract.exe` and required `.traineddata` packs exist on this PC.
     If running on a new PC without Tesseract, automatically downloads and silently installs
-    Tesseract-OCR 5.4.0 into `%LOCALAPPDATA%\\Programs\\Tesseract-OCR` (no Admin required)
-    and fetches any missing `.traineddata` language packs.
+    Tesseract-OCR 5.4.0 into `%LOCALAPPDATA%\\Programs\\Tesseract-OCR` (bypassing UAC WinError 740
+    via __COMPAT_LAYER=RunAsInvoker, with RunAs fallback) and fetches any missing `.traineddata` packs.
     """
     with _TESSERACT_INSTALL_LOCK:
         tess_bin = locate_tesseract_binary()
         if not tess_bin:
             if progress_callback:
                 progress_callback(
-                    "⏳ Máy chưa cài Tesseract OCR — Đang tự động tải & cài đặt ngầm (chỉ 1 lần đầu, ~25s)..."
+                    "⏳ Máy chưa có Tesseract OCR — Đang bắt đầu tải bộ cài tự động (0%)..."
                 )
             local_app = os.environ.get("LOCALAPPDATA", "")
             target_dir = (
@@ -255,19 +255,55 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
             os.makedirs(target_dir, exist_ok=True)
             installer_path = os.path.join(os.environ.get("TEMP", APP_DIR), "tesseract_setup_argon.exe")
             try:
-                resp = requests.get(TESSERACT_INSTALLER_URL, stream=True, timeout=90)
-                if resp.status_code == 200:
-                    with open(installer_path, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=262144):
-                            if chunk:
-                                f.write(chunk)
+                need_download = True
+                if os.path.isfile(installer_path) and os.path.getsize(installer_path) > 30_000_000:
+                    need_download = False
+
+                if need_download:
+                    resp = requests.get(TESSERACT_INSTALLER_URL, stream=True, timeout=120)
+                    if resp.status_code == 200:
+                        total_bytes = int(resp.headers.get("Content-Length", 0) or 39_800_000)
+                        downloaded = 0
+                        last_pct = -1
+                        with open(installer_path, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=262144):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    pct = min(99, int(downloaded * 100 / max(1, total_bytes)))
+                                    if progress_callback and pct >= last_pct + 5:
+                                        last_pct = pct
+                                        mb_done = downloaded / (1024 * 1024)
+                                        mb_total = total_bytes / (1024 * 1024)
+                                        progress_callback(
+                                            f"⏳ Đang tải bộ cài Tesseract OCR: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)..."
+                                        )
+
+                if os.path.isfile(installer_path) and os.path.getsize(installer_path) > 10_000_000:
                     if progress_callback:
-                        progress_callback("⏳ Đang giải nén Tesseract-OCR vào máy (không cần quyền Admin)...")
-                    subprocess.run(
-                        [installer_path, "/S", f"/D={target_dir}"],
-                        timeout=150,
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                    )
+                        progress_callback("⏳ Đang giải nén & cài đặt ngầm Tesseract-OCR vào máy (~10s)...")
+
+                    # Bypass Windows UAC WinError 740 by running NSIS installer as current user (RunAsInvoker)
+                    run_env = os.environ.copy()
+                    run_env["__COMPAT_LAYER"] = "RunAsInvoker"
+                    try:
+                        subprocess.run(
+                            [installer_path, "/S", f"/D={target_dir}"],
+                            env=run_env,
+                            timeout=180,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        )
+                    except OSError:
+                        # Fallback via PowerShell Start-Process if OS policy blocks direct CreateProcess
+                        ps_cmd = (
+                            f"Start-Process -FilePath '{installer_path}' "
+                            f"-ArgumentList '/S', '/D={target_dir}' -Verb RunAs -Wait"
+                        )
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                            timeout=180,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        )
             except Exception as e:
                 print(f"Auto-install Tesseract warning: {e}")
 
@@ -289,9 +325,9 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
                 continue
 
             if progress_callback:
-                progress_callback(f"⏳ Đang tự động tải gói ngôn ngữ OCR '{lang_code}.traineddata'...")
+                progress_callback(f"⏳ Đang tải gói ngôn ngữ OCR '{lang_code}.traineddata'...")
             try:
-                r = requests.get(f"{TESSDATA_FAST_BASE_URL}/{lang_code}.traineddata", timeout=45)
+                r = requests.get(f"{TESSDATA_FAST_BASE_URL}/{lang_code}.traineddata", timeout=60)
                 if r.status_code == 200 and len(r.content) > 50000:
                     try:
                         with open(dest_file, "wb") as f:
@@ -316,7 +352,10 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
             except Exception as e:
                 print(f"Download traineddata ({lang_code}) warning: {e}")
 
+        if progress_callback:
+            progress_callback("✓ Đã cài xong Tesseract OCR! Đang nhận diện & dịch chữ...")
         return True
+
 
 
 
