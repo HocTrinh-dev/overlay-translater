@@ -30,7 +30,15 @@ import PyQt5.QtCore
 import PyQt5.QtGui
 import PyQt5.QtWidgets
 
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+_EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+if (
+    os.path.basename(_EXE_DIR).lower() == "dist"
+    and os.path.exists(os.path.join(os.path.dirname(_EXE_DIR), "argon_overlay_translator.py"))
+):
+    APP_DIR = os.path.dirname(_EXE_DIR)
+else:
+    APP_DIR = _EXE_DIR
+
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 EXTERNAL_SCRIPT = os.path.join(APP_DIR, "argon_overlay_translator.py")
 
@@ -69,7 +77,7 @@ DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/HocTrinh-dev/overlay-tra
 
 
 def auto_update_before_launch():
-    """Silently fetch latest argon_overlay_translator.py from GitHub or git before launching UI."""
+    """Silently fetch latest argon_overlay_translator.py from git or GitHub before launching UI."""
     update_url = DEFAULT_UPDATE_URL
     auto_update = True
 
@@ -85,6 +93,21 @@ def auto_update_before_launch():
     if not auto_update:
         return
 
+    git_dir = os.path.join(APP_DIR, ".git")
+    if os.path.isdir(git_dir):
+        try:
+            proc = subprocess.run(
+                ["git", "pull", "--rebase", "--autostash"],
+                cwd=APP_DIR,
+                capture_output=True,
+                timeout=4,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            )
+            if proc.returncode == 0:
+                return
+        except Exception:
+            pass
+
     if update_url:
         try:
             sep = "&" if "?" in update_url else "?"
@@ -93,19 +116,6 @@ def auto_update_before_launch():
                 with open(EXTERNAL_SCRIPT, "w", encoding="utf-8") as f:
                     f.write(resp.text)
                 return
-        except Exception:
-            pass
-
-    git_dir = os.path.join(APP_DIR, ".git")
-    if os.path.isdir(git_dir):
-        try:
-            subprocess.run(
-                ["git", "pull"],
-                cwd=APP_DIR,
-                capture_output=True,
-                timeout=4,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            )
         except Exception:
             pass
 

@@ -30,9 +30,25 @@ DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(DEFAULT_TESSERACT):
     pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT
 
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+_EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+if (
+    os.path.basename(_EXE_DIR).lower() == "dist"
+    and os.path.exists(os.path.join(os.path.dirname(_EXE_DIR), "argon_overlay_translator.py"))
+):
+    APP_DIR = os.path.dirname(_EXE_DIR)
+else:
+    APP_DIR = _EXE_DIR
+
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 MAIN_SCRIPT_FILE = os.path.join(APP_DIR, "argon_overlay_translator.py")
+
+STARTUP_SCRIPT_SNAPSHOT = ""
+if os.path.exists(MAIN_SCRIPT_FILE):
+    try:
+        with open(MAIN_SCRIPT_FILE, "r", encoding="utf-8") as _f:
+            STARTUP_SCRIPT_SNAPSHOT = _f.read().replace("\r\n", "\n")
+    except Exception:
+        pass
 
 
 def normalize_github_raw_url(url: str) -> str:
@@ -196,13 +212,55 @@ class TranslationWorker(QThread):
 class HotUpdateWorker(QThread):
     finished_signal = pyqtSignal(bool, str)  # (updated_and_should_restart, status_message)
 
-    def __init__(self, update_url: str, target_script_path: str):
+    def __init__(self, update_url: str, target_script_path: str, running_snapshot: str = None):
         super().__init__()
         self.update_url = normalize_github_raw_url(update_url)
         self.target_script_path = target_script_path
+        self.running_snapshot = (
+            running_snapshot if running_snapshot is not None else STARTUP_SCRIPT_SNAPSHOT
+        )
+
+    def _read_disk_code(self) -> str:
+        if os.path.exists(self.target_script_path):
+            try:
+                with open(self.target_script_path, "r", encoding="utf-8") as f:
+                    return f.read().replace("\r\n", "\n")
+            except Exception:
+                return ""
+        return ""
 
     def run(self):
-        # 1. If a GitHub Raw URL is configured, download directly (< 0.5s, no git required on client)
+        script_dir = os.path.dirname(self.target_script_path)
+        git_dir = os.path.join(script_dir, ".git")
+        git_pulled_ok = False
+
+        # 1. Priority 1: If inside a Git repository, run `git pull` (supports Private & Public GitHub repos)
+        if os.path.isdir(git_dir):
+            try:
+                proc = subprocess.run(
+                    ["git", "pull", "--rebase", "--autostash"],
+                    cwd=script_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                )
+                if proc.returncode == 0:
+                    git_pulled_ok = True
+            except Exception:
+                pass
+
+        # 2. Check if local disk script is already newer than what's currently running in memory
+        disk_code = self._read_disk_code()
+        if disk_code and self.running_snapshot and disk_code != self.running_snapshot:
+            self.finished_signal.emit(True, "✓ Detected new code! Hot-restarting app...")
+            return
+
+        if git_pulled_ok:
+            self.finished_signal.emit(False, "✓ Already up to date (Git & local code synced).")
+            return
+
+        # 3. Priority 2: Direct download via GitHub Raw URL (for standalone .exe without .git)
         if self.update_url:
             try:
                 cache_bust_url = (
@@ -212,7 +270,10 @@ class HotUpdateWorker(QThread):
                 )
                 resp = requests.get(cache_bust_url, timeout=8)
                 if resp.status_code != 200:
-                    self.finished_signal.emit(False, f"Update Error: HTTP {resp.status_code} from GitHub.")
+                    self.finished_signal.emit(
+                        False,
+                        f"Update Error: HTTP {resp.status_code} (Make GitHub repo Public or keep .git folder)."
+                    )
                     return
 
                 new_code = resp.text
@@ -220,12 +281,7 @@ class HotUpdateWorker(QThread):
                     self.finished_signal.emit(False, "Update Error: Downloaded file is not a valid Argon script.")
                     return
 
-                old_code = ""
-                if os.path.exists(self.target_script_path):
-                    with open(self.target_script_path, "r", encoding="utf-8") as f:
-                        old_code = f.read()
-
-                if new_code.replace("\r\n", "\n") == old_code.replace("\r\n", "\n"):
+                if new_code.replace("\r\n", "\n") == disk_code:
                     self.finished_signal.emit(False, "✓ Already up to date with GitHub.")
                     return
 
@@ -236,31 +292,6 @@ class HotUpdateWorker(QThread):
                 return
             except Exception as e:
                 self.finished_signal.emit(False, f"Update failed: {e}")
-                return
-
-        # 2. Fallback: If inside a Git repository, run `git pull`
-        git_dir = os.path.join(os.path.dirname(self.target_script_path), ".git")
-        if os.path.isdir(git_dir):
-            try:
-                proc = subprocess.run(
-                    ["git", "pull"],
-                    cwd=os.path.dirname(self.target_script_path),
-                    capture_output=True,
-                    text=True,
-                    timeout=12,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                )
-                output = (proc.stdout or proc.stderr or "").strip()
-                if proc.returncode == 0:
-                    if "Already up to date" in output or "Already up-to-date" in output:
-                        self.finished_signal.emit(False, "✓ Git: Already up to date.")
-                    else:
-                        self.finished_signal.emit(True, "✓ Git pull succeeded! Restarting app...")
-                else:
-                    self.finished_signal.emit(False, f"Git pull error: {output[:80]}")
-                return
-            except Exception as e:
-                self.finished_signal.emit(False, f"Git update error: {e}")
                 return
 
         self.finished_signal.emit(False, "NO_URL_CONFIGURED")

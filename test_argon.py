@@ -107,17 +107,18 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         hud.close()
 
     def test_hot_update_worker_downloads_and_detects_changes(self):
-        """Verify HotUpdateWorker downloads new script from GitHub Raw and writes it atomically."""
+        """Verify HotUpdateWorker detects local/git changes and downloads from GitHub Raw."""
         target_script = os.path.join(self.temp_dir.name, "argon_overlay_translator.py")
+        old_code = "# Old version\nclass MainStudioWindow:\n    pass\n"
         with open(target_script, "w", encoding="utf-8") as f:
-            f.write("# Old version\nclass MainStudioWindow:\n    pass\n")
+            f.write(old_code)
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = "# New version v2\nclass MainStudioWindow:\n    pass\n"
 
         results = []
-        worker = aot.HotUpdateWorker(aot.DEFAULT_UPDATE_URL, target_script)
+        worker = aot.HotUpdateWorker(aot.DEFAULT_UPDATE_URL, target_script, running_snapshot=old_code)
         worker.finished_signal.connect(lambda restart, msg: results.append((restart, msg)))
 
         with patch("argon_overlay_translator.requests.get", return_value=mock_resp):
@@ -127,6 +128,15 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertTrue(results[0][0])
         with open(target_script, "r", encoding="utf-8") as f:
             self.assertIn("# New version v2", f.read())
+
+        # Also verify that if disk code was updated locally or via git pull, it triggers hot-restart
+        # without needing raw.githubusercontent.com (supporting Private GitHub repos)
+        results_local = []
+        worker_local = aot.HotUpdateWorker(aot.DEFAULT_UPDATE_URL, target_script, running_snapshot=old_code)
+        worker_local.finished_signal.connect(lambda restart, msg: results_local.append((restart, msg)))
+        worker_local.run()
+        self.assertEqual(len(results_local), 1)
+        self.assertTrue(results_local[0][0])
 
     @patch("argon_overlay_translator.keyboard.add_hotkey")
     def test_ui_dropdown_and_input_heights(self, mock_hotkey):
