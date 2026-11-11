@@ -1591,6 +1591,9 @@ class HotUpdateWorker(QThread):
 # 2. FLOATING HUD OVERLAY WINDOW (DRAGGABLE, RESIZABLE, CLICK-THROUGH)
 # =====================================================================
 class FloatingOverlayHUD(QWidget):
+    MIN_HUD_W = 100
+    MIN_HUD_H = 44
+
     def __init__(self):
         super().__init__()
         self.blocks = []
@@ -1598,6 +1601,9 @@ class FloatingOverlayHUD(QWidget):
         self.is_fullscreen = False
         self.is_capturing = False
         self.resizing = False
+        self.resize_edge = ""
+        self.resize_start_rect = None
+        self.resize_start_pos = None
         self.drag_offset = None
         self.dpr = 1.0
         self.overlay_style = "replace"  # "replace" (In-Place Chameleon), "transparent" (Halo Text Only), "glass" (Translucent Pill)
@@ -1681,7 +1687,7 @@ class FloatingOverlayHUD(QWidget):
             painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
 
             if not self.blocks:
-                badge_rect = QRectF(8, 8, 295, 24)
+                badge_rect = QRectF(8, 8, min(295, max(80, w - 16)), 24)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(15, 23, 42, 175)))
                 painter.drawRoundedRect(badge_rect, 6, 6)
@@ -1694,12 +1700,38 @@ class FloatingOverlayHUD(QWidget):
                     "⚡ Kéo khung • F8: Quét vùng • F9: Dịch • F10: Khóa"
                 )
 
+            # Draw 4 corner brackets & 4 edge midpoint ticks for 8-direction resizing
             grip_path = QPainterPath()
-            grip_path.moveTo(w - 16, h - 3)
-            grip_path.lineTo(w - 3, h - 16)
-            grip_path.moveTo(w - 10, h - 3)
-            grip_path.lineTo(w - 3, h - 10)
-            painter.setPen(QPen(QColor(129, 140, 248, 220), 2, Qt.SolidLine, Qt.RoundCap))
+            cl = 12  # corner arm length
+            # Top-Left corner
+            grip_path.moveTo(2, 2 + cl)
+            grip_path.lineTo(2, 2)
+            grip_path.lineTo(2 + cl, 2)
+            # Top-Right corner
+            grip_path.moveTo(w - 2 - cl, 2)
+            grip_path.lineTo(w - 2, 2)
+            grip_path.lineTo(w - 2, 2 + cl)
+            # Bottom-Left corner
+            grip_path.moveTo(2, h - 2 - cl)
+            grip_path.lineTo(2, h - 2)
+            grip_path.lineTo(2 + cl, h - 2)
+            # Bottom-Right corner
+            grip_path.moveTo(w - 2 - cl, h - 2)
+            grip_path.lineTo(w - 2, h - 2)
+            grip_path.lineTo(w - 2, h - 2 - cl)
+            # 4 Edge midpoint ticks (Top, Bottom, Left, Right)
+            mx, my = w / 2.0, h / 2.0
+            el = 10
+            grip_path.moveTo(mx - el, 2)
+            grip_path.lineTo(mx + el, 2)
+            grip_path.moveTo(mx - el, h - 2)
+            grip_path.lineTo(mx + el, h - 2)
+            grip_path.moveTo(2, my - el)
+            grip_path.lineTo(2, my + el)
+            grip_path.moveTo(w - 2, my - el)
+            grip_path.lineTo(w - 2, my + el)
+
+            painter.setPen(QPen(QColor(129, 140, 248, 235), 2.5, Qt.SolidLine, Qt.RoundCap))
             painter.drawPath(grip_path)
 
         weight = QFont.Bold if self.font_bold else QFont.Normal
@@ -1799,36 +1831,113 @@ class FloatingOverlayHUD(QWidget):
                     outline_qcolor
                 )
 
+    def _hit_test_resize_edge(self, pos: QPoint) -> str:
+        """
+        Detect which of the 4 corners ('top_left', 'top_right', 'bottom_left', 'bottom_right')
+        or 4 edges ('top', 'bottom', 'left', 'right') the mouse is hovering over.
+        Returns '' if inside the draggable interior.
+        """
+        x, y = pos.x(), pos.y()
+        w, h = self.width(), self.height()
+        corner_m = 16
+        edge_m = 10
+
+        on_left = x <= corner_m
+        on_right = x >= w - corner_m
+        on_top = y <= corner_m
+        on_bottom = y >= h - corner_m
+
+        if on_top and on_left:
+            return "top_left"
+        if on_bottom and on_right:
+            return "bottom_right"
+        if on_top and on_right:
+            return "top_right"
+        if on_bottom and on_left:
+            return "bottom_left"
+
+        if x <= edge_m:
+            return "left"
+        if x >= w - edge_m:
+            return "right"
+        if y <= edge_m:
+            return "top"
+        if y >= h - edge_m:
+            return "bottom"
+        return ""
+
+    def _update_cursor_for_edge(self, edge: str):
+        cursor_map = {
+            "top_left": Qt.SizeFDiagCursor,
+            "bottom_right": Qt.SizeFDiagCursor,
+            "top_right": Qt.SizeBDiagCursor,
+            "bottom_left": Qt.SizeBDiagCursor,
+            "left": Qt.SizeHorCursor,
+            "right": Qt.SizeHorCursor,
+            "top": Qt.SizeVerCursor,
+            "bottom": Qt.SizeVerCursor,
+        }
+        self.setCursor(cursor_map.get(edge, Qt.SizeAllCursor))
+
+    def _apply_resize_drag(self, global_pos: QPoint):
+        if not self.resize_start_rect or not self.resize_start_pos or not self.resize_edge:
+            return
+        dx = global_pos.x() - self.resize_start_pos.x()
+        dy = global_pos.y() - self.resize_start_pos.y()
+
+        r = QRect(self.resize_start_rect)
+        left, top, right, bottom = r.left(), r.top(), r.right(), r.bottom()
+
+        if "left" in self.resize_edge:
+            left = min(left + dx, right - self.MIN_HUD_W + 1)
+        if "right" in self.resize_edge:
+            right = max(right + dx, left + self.MIN_HUD_W - 1)
+        if "top" in self.resize_edge:
+            top = min(top + dy, bottom - self.MIN_HUD_H + 1)
+        if "bottom" in self.resize_edge:
+            bottom = max(bottom + dy, top + self.MIN_HUD_H - 1)
+
+        self.setGeometry(QRect(QPoint(left, top), QPoint(right, bottom)))
 
     def mousePressEvent(self, event):
         if self.is_locked or self.is_fullscreen:
             return
         if event.button() == Qt.LeftButton:
-            if event.x() >= self.width() - 20 and event.y() >= self.height() - 20:
+            edge = self._hit_test_resize_edge(event.pos())
+            if edge:
                 self.resizing = True
+                self.resize_edge = edge
+                self.resize_start_rect = self.geometry()
+                self.resize_start_pos = event.globalPos()
+                self._update_cursor_for_edge(edge)
             else:
+                self.resizing = False
+                self.resize_edge = ""
                 self.drag_offset = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
         if self.is_locked or self.is_fullscreen:
             return
-        if event.x() >= self.width() - 20 and event.y() >= self.height() - 20:
-            self.setCursor(Qt.SizeFDiagCursor)
-        else:
-            self.setCursor(Qt.SizeAllCursor)
-
-        if self.resizing:
-            new_w = max(220, event.x())
-            new_h = max(90, event.y())
-            self.resize(new_w, new_h)
-        elif self.drag_offset and event.buttons() & Qt.LeftButton:
+        if self.resizing and (event.buttons() & Qt.LeftButton):
+            self._apply_resize_drag(event.globalPos())
+            event.accept()
+            return
+        if self.drag_offset and (event.buttons() & Qt.LeftButton):
             self.move(event.globalPos() - self.drag_offset)
             event.accept()
+            return
+
+        edge = self._hit_test_resize_edge(event.pos())
+        self._update_cursor_for_edge(edge)
 
     def mouseReleaseEvent(self, event):
         self.resizing = False
+        self.resize_edge = ""
+        self.resize_start_rect = None
+        self.resize_start_pos = None
         self.drag_offset = None
+
 
 
 # =====================================================================

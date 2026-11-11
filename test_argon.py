@@ -560,6 +560,38 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         # Bounding box x starts at 60 ('Crimson'), not 10 ('[14:30]'), and ends at 175 ('Blade'), not 220 ('9999')
         self.assertEqual(blocks[0]["rect"], (60, 40, 115, 20))
 
+    def test_hud_8_direction_resize_edges_and_corners(self):
+        """Verify FloatingOverlayHUD supports resizing from all 4 corners and all 4 edges."""
+        hud = aot.FloatingOverlayHUD()
+        hud.setGeometry(200, 200, 400, 200)
+
+        # 1. Verify hit-testing for 4 corners and 4 edges + interior
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(4, 4)), "top_left")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(396, 4)), "top_right")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(4, 196)), "bottom_left")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(396, 196)), "bottom_right")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(200, 3)), "top")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(200, 197)), "bottom")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(3, 100)), "left")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(397, 100)), "right")
+        self.assertEqual(hud._hit_test_resize_edge(aot.QPoint(200, 100)), "")
+
+        # 2. Verify resizing from top_left corner expands left & top while keeping bottom-right anchored
+        hud.resizing = True
+        hud.resize_edge = "top_left"
+        hud.resize_start_rect = aot.QRect(200, 200, 400, 200)
+        hud.resize_start_pos = aot.QPoint(200, 200)
+        hud._apply_resize_drag(aot.QPoint(150, 160))
+        self.assertEqual(hud.geometry(), aot.QRect(150, 160, 450, 240))
+
+        # 3. Verify resizing from right edge expands width only
+        hud.resize_edge = "right"
+        hud.resize_start_rect = hud.geometry()
+        hud.resize_start_pos = aot.QPoint(600, 280)
+        hud._apply_resize_drag(aot.QPoint(680, 280))
+        self.assertEqual(hud.geometry(), aot.QRect(150, 160, 530, 240))
+        hud.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
