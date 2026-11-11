@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import subprocess
+import shutil
 import requests
 from PIL import Image
 import mss
@@ -38,20 +39,50 @@ else:
     APP_DIR = _EXE_DIR
 
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-_TESSERACT_CANDIDATES = [
-    os.path.join(APP_DIR, "Tesseract-OCR", "tesseract.exe"),
-    DEFAULT_TESSERACT,
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR", "tesseract.exe"),
-]
-for _cand in _TESSERACT_CANDIDATES:
-    if _cand and os.path.exists(_cand):
-        pytesseract.pytesseract.tesseract_cmd = _cand
-        _tessdata_dir = os.path.join(os.path.dirname(_cand), "tessdata")
-        if os.path.isdir(_tessdata_dir):
-            os.environ["TESSDATA_PREFIX"] = _tessdata_dir
-        break
+TESSERACT_INSTALLER_URL = (
+    "https://github.com/UB-Mannheim/tesseract/releases/download/"
+    "v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+)
+TESSDATA_FAST_BASE_URL = "https://github.com/tesseract-ocr/tessdata_fast/raw/main"
+_TESSERACT_INSTALL_LOCK = threading.Lock()
+
+
+def _get_tesseract_candidates() -> list:
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    user_prof = os.environ.get("USERPROFILE", "")
+    cands = [
+        getattr(pytesseract.pytesseract, "tesseract_cmd", ""),
+        os.path.join(APP_DIR, "Tesseract-OCR", "tesseract.exe"),
+        DEFAULT_TESSERACT,
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    if local_app:
+        cands.append(os.path.join(local_app, "Programs", "Tesseract-OCR", "tesseract.exe"))
+        cands.append(os.path.join(local_app, "Tesseract-OCR", "tesseract.exe"))
+    if user_prof:
+        cands.append(os.path.join(user_prof, "AppData", "Local", "Programs", "Tesseract-OCR", "tesseract.exe"))
+    which_tess = shutil.which("tesseract")
+    if which_tess:
+        cands.append(which_tess)
+    return cands
+
+
+def locate_tesseract_binary() -> str:
+    """Find an existing tesseract.exe on the current machine and configure pytesseract."""
+    for cand in _get_tesseract_candidates():
+        if cand and os.path.isfile(cand):
+            pytesseract.pytesseract.tesseract_cmd = cand
+            tessdata_dir = os.path.join(os.path.dirname(cand), "tessdata")
+            custom_tessdata = os.path.join(APP_DIR, "tessdata")
+            if os.path.isdir(custom_tessdata) and os.path.isfile(os.path.join(custom_tessdata, "eng.traineddata")):
+                os.environ["TESSDATA_PREFIX"] = custom_tessdata
+            elif os.path.isdir(tessdata_dir):
+                os.environ["TESSDATA_PREFIX"] = tessdata_dir
+            return cand
+    return ""
+
+
+locate_tesseract_binary()
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CODEX_FILE = os.path.join(APP_DIR, "codex.json")
@@ -155,11 +186,11 @@ def is_already_target_language(text: str, target_lang: str) -> bool:
 def get_installed_tesseract_langs() -> list:
     """Return list of installed Tesseract language codes without spawning slow subprocesses if tessdata dir exists."""
     tess_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", DEFAULT_TESSERACT)
-    tess_dir = os.path.join(os.path.dirname(tess_cmd), "tessdata")
+    tess_dir = os.environ.get("TESSDATA_PREFIX") or os.path.join(os.path.dirname(tess_cmd), "tessdata")
     if os.path.isdir(tess_dir):
         try:
             langs = [
-                 fn[:-12] for fn in os.listdir(tess_dir)
+                fn[:-12] for fn in os.listdir(tess_dir)
                 if fn.lower().endswith(".traineddata") and fn[:-12] != "osd"
             ]
             if langs:
@@ -170,6 +201,17 @@ def get_installed_tesseract_langs() -> list:
         return pytesseract.get_languages(config="")
     except Exception:
         return ["eng"]
+
+
+def get_requested_tesseract_langs(selection_text: str) -> list:
+    """Return the list of desired Tesseract language codes for a UI combo selection."""
+    text_lower = (selection_text or "").lower()
+    if "multi" in text_lower or "đa ngôn ngữ" in text_lower or "+" in text_lower:
+        return ["eng", "chi_sim", "jpn", "kor"]
+    for code in ("chi_sim", "jpn", "kor", "eng"):
+        if f"({code})" in text_lower or text_lower == code:
+            return [code]
+    return ["eng"]
 
 
 def resolve_ocr_lang_string(selection_text: str, installed_langs: list = None) -> str:
@@ -188,6 +230,94 @@ def resolve_ocr_lang_string(selection_text: str, installed_langs: list = None) -
         if f"({code})" in text_lower or text_lower == code:
             return code
     return "eng"
+
+
+def ensure_tesseract_installed(required_langs: list = None, progress_callback=None) -> bool:
+    """
+    Ensure `tesseract.exe` and required `.traineddata` packs exist on this PC.
+    If running on a new PC without Tesseract, automatically downloads and silently installs
+    Tesseract-OCR 5.4.0 into `%LOCALAPPDATA%\\Programs\\Tesseract-OCR` (no Admin required)
+    and fetches any missing `.traineddata` language packs.
+    """
+    with _TESSERACT_INSTALL_LOCK:
+        tess_bin = locate_tesseract_binary()
+        if not tess_bin:
+            if progress_callback:
+                progress_callback(
+                    "⏳ Máy chưa cài Tesseract OCR — Đang tự động tải & cài đặt ngầm (chỉ 1 lần đầu, ~25s)..."
+                )
+            local_app = os.environ.get("LOCALAPPDATA", "")
+            target_dir = (
+                os.path.join(local_app, "Programs", "Tesseract-OCR")
+                if local_app
+                else os.path.join(APP_DIR, "Tesseract-OCR")
+            )
+            os.makedirs(target_dir, exist_ok=True)
+            installer_path = os.path.join(os.environ.get("TEMP", APP_DIR), "tesseract_setup_argon.exe")
+            try:
+                resp = requests.get(TESSERACT_INSTALLER_URL, stream=True, timeout=90)
+                if resp.status_code == 200:
+                    with open(installer_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=262144):
+                            if chunk:
+                                f.write(chunk)
+                    if progress_callback:
+                        progress_callback("⏳ Đang giải nén Tesseract-OCR vào máy (không cần quyền Admin)...")
+                    subprocess.run(
+                        [installer_path, "/S", f"/D={target_dir}"],
+                        timeout=150,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    )
+            except Exception as e:
+                print(f"Auto-install Tesseract warning: {e}")
+
+            tess_bin = locate_tesseract_binary()
+            if not tess_bin:
+                return False
+
+        tessdata_dir = os.environ.get("TESSDATA_PREFIX") or os.path.join(os.path.dirname(tess_bin), "tessdata")
+        os.makedirs(tessdata_dir, exist_ok=True)
+        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+
+        langs_to_check = list(dict.fromkeys((required_langs or ["eng"]) + ["eng"]))
+        for lang_code in langs_to_check:
+            lang_code = lang_code.strip()
+            if not lang_code:
+                continue
+            dest_file = os.path.join(tessdata_dir, f"{lang_code}.traineddata")
+            if os.path.isfile(dest_file) and os.path.getsize(dest_file) > 50000:
+                continue
+
+            if progress_callback:
+                progress_callback(f"⏳ Đang tự động tải gói ngôn ngữ OCR '{lang_code}.traineddata'...")
+            try:
+                r = requests.get(f"{TESSDATA_FAST_BASE_URL}/{lang_code}.traineddata", timeout=45)
+                if r.status_code == 200 and len(r.content) > 50000:
+                    try:
+                        with open(dest_file, "wb") as f:
+                            f.write(r.content)
+                    except PermissionError:
+                        # Fallback if C:\Program Files\Tesseract-OCR\tessdata is read-only
+                        writable_tessdata = os.path.join(APP_DIR, "tessdata")
+                        os.makedirs(writable_tessdata, exist_ok=True)
+                        if os.path.isdir(tessdata_dir):
+                            for fn in os.listdir(tessdata_dir):
+                                src_f = os.path.join(tessdata_dir, fn)
+                                dst_f = os.path.join(writable_tessdata, fn)
+                                if os.path.isfile(src_f) and not os.path.isfile(dst_f):
+                                    try:
+                                        shutil.copyfile(src_f, dst_f)
+                                    except Exception:
+                                        pass
+                        tessdata_dir = writable_tessdata
+                        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+                        with open(os.path.join(tessdata_dir, f"{lang_code}.traineddata"), "wb") as f:
+                            f.write(r.content)
+            except Exception as e:
+                print(f"Download traineddata ({lang_code}) warning: {e}")
+
+        return True
+
 
 
 # =====================================================================
@@ -845,6 +975,7 @@ class TranslationKnowledgeManager:
 class TranslationWorker(QThread):
     finished_signal = pyqtSignal(object, str)  # (list_of_blocks_or_None, status_message)
     error_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(str)
 
     def __init__(
         self,
@@ -855,7 +986,8 @@ class TranslationWorker(QThread):
         api_key,
         model_name,
         last_raw_text,
-        knowledge_mgr: TranslationKnowledgeManager = None
+        knowledge_mgr: TranslationKnowledgeManager = None,
+        src_selection_text: str = ""
     ):
         super().__init__()
         self.pil_img = pil_img
@@ -866,15 +998,33 @@ class TranslationWorker(QThread):
         self.model_name = model_name.strip()
         self.last_raw_text = last_raw_text
         self.knowledge_mgr = knowledge_mgr
+        self.src_selection_text = src_selection_text
 
     def run(self):
         try:
             data = pytesseract.image_to_data(
                 self.pil_img, lang=self.tess_lang, output_type=pytesseract.Output.DICT
             )
-        except Exception as e:
-            self.error_signal.emit(f"Tesseract OCR Error: Check installation path ({e})")
-            return
+        except Exception as first_err:
+            req_langs = (
+                get_requested_tesseract_langs(self.src_selection_text)
+                if self.src_selection_text
+                else [c for c in self.tess_lang.split("+") if c]
+            )
+            if ensure_tesseract_installed(required_langs=req_langs, progress_callback=self.progress_signal.emit):
+                if self.src_selection_text:
+                    self.tess_lang = resolve_ocr_lang_string(self.src_selection_text)
+                try:
+                    data = pytesseract.image_to_data(
+                        self.pil_img, lang=self.tess_lang, output_type=pytesseract.Output.DICT
+                    )
+                except Exception as e:
+                    self.error_signal.emit(f"Tesseract OCR Error: Check installation path ({e})")
+                    return
+            else:
+                self.error_signal.emit(f"Tesseract OCR Error: Check installation path ({first_err})")
+                return
+
 
         # Group words into logical lines using (block_num, par_num, line_num)
         lines = []
@@ -1184,6 +1334,22 @@ class HotUpdateWorker(QThread):
                 return ""
         return ""
 
+    def _sync_missing_companion_files(self, script_dir: str):
+        """If running standalone .exe on another PC, fetch missing Codex / 133K Offline Dictionary from GitHub."""
+        if not self.update_url or "/" not in self.update_url:
+            return
+        base_raw_dir = self.update_url.rsplit("/", 1)[0]
+        for fname in ("codex.json", "Names.txt", "offline_en_vi.json"):
+            local_p = os.path.join(script_dir, fname)
+            if not os.path.isfile(local_p):
+                try:
+                    r = requests.get(f"{base_raw_dir}/{fname}", timeout=25)
+                    if r.status_code == 200 and len(r.content) > 32:
+                        with open(local_p, "wb") as f:
+                            f.write(r.content)
+                except Exception:
+                    pass
+
     def run(self):
         script_dir = os.path.dirname(self.target_script_path)
         git_dir = os.path.join(script_dir, ".git")
@@ -1218,6 +1384,7 @@ class HotUpdateWorker(QThread):
         # 3. Priority 2: Direct download via GitHub Raw URL (for standalone .exe without .git)
         if self.update_url:
             try:
+                self._sync_missing_companion_files(script_dir)
                 cache_bust_url = (
                     f"{self.update_url}?t={int(time.time())}"
                     if "?" not in self.update_url
@@ -1250,6 +1417,7 @@ class HotUpdateWorker(QThread):
                 return
 
         self.finished_signal.emit(False, "NO_URL_CONFIGURED")
+
 
 
 # =====================================================================
@@ -2737,7 +2905,8 @@ class MainStudioWindow(QWidget):
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
-        tess_lang = resolve_ocr_lang_string(self.cb_src.currentText())
+        src_selection = self.cb_src.currentText()
+        tess_lang = resolve_ocr_lang_string(src_selection)
         target_lang = self.cb_dst.currentText()
 
         self.lbl_status.setText("⏳ Đang OCR & tra cứu Bách Khoa / Cache...")
@@ -2749,10 +2918,12 @@ class MainStudioWindow(QWidget):
             api_key=self.txt_key.text(),
             model_name=self.txt_model.text(),
             last_raw_text=self.last_raw_text,
-            knowledge_mgr=self.knowledge_mgr
+            knowledge_mgr=self.knowledge_mgr,
+            src_selection_text=src_selection
         )
         self.worker.finished_signal.connect(self._on_translation_done)
         self.worker.error_signal.connect(self._on_translation_error)
+        self.worker.progress_signal.connect(self._on_translation_error)
         self.worker.start()
 
     def _on_translation_done(self, blocks, status_msg):

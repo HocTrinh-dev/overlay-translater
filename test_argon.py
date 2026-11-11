@@ -433,6 +433,53 @@ class TestArgonOverlayTranslator(unittest.TestCase):
 
         studio.close()
 
+    def test_auto_install_tesseract_fallback_on_new_machine(self):
+        """Verify TranslationWorker automatically triggers ensure_tesseract_installed and retries OCR on a new machine."""
+        img = Image.new("RGB", (120, 40), color=(30, 30, 30))
+        mgr = aot.TranslationKnowledgeManager(
+            codex_path=os.path.join(self.temp_dir.name, "codex.json"),
+            cache_path=os.path.join(self.temp_dir.name, "cache.json"),
+        )
+        mgr.add_or_update_codex("Victory", "Chiến Thắng")
+
+        ocr_result = {
+            "text": ["Victory"],
+            "conf": ["95"],
+            "left": [10],
+            "top": [8],
+            "width": [80],
+            "height": [20],
+            "block_num": [1],
+            "par_num": [1],
+            "line_num": [1],
+        }
+        worker = aot.TranslationWorker(
+            pil_img=img,
+            tess_lang="eng",
+            target_lang="Vietnamese",
+            api_url="",
+            api_key="",
+            model_name="",
+            last_raw_text="",
+            knowledge_mgr=mgr,
+            src_selection_text="English (eng)",
+        )
+        results = []
+        worker.finished_signal.connect(lambda blocks, msg: results.append((blocks, msg)))
+
+        # First call raises TesseractNotFoundError, second call succeeds after ensure_tesseract_installed
+        with patch(
+            "argon_overlay_translator.pytesseract.image_to_data",
+            side_effect=[RuntimeError("tesseract is not installed"), ocr_result],
+        ) as mock_ocr, patch(
+            "argon_overlay_translator.ensure_tesseract_installed", return_value=True
+        ) as mock_ensure:
+            worker.run()
+            self.assertEqual(mock_ocr.call_count, 2)
+            mock_ensure.assert_called_once()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0][0][0]["text"], "Chiến Thắng")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
