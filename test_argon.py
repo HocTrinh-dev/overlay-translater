@@ -592,6 +592,53 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertEqual(hud.geometry(), aot.QRect(150, 160, 530, 240))
         hud.close()
 
+    def test_gaming_mode_features_antifocus_f7_compact_and_pixel_delta(self):
+        """Verify anti-focus-steal HUD flags, F7 combat quick-hide, Compact Gaming Mode, and Pixel-Delta frame signatures."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = os.path.join(tmpdir, "gaming_config.json")
+            studio = aot.MainStudioWindow(config_path=cfg_path)
+
+            # 1. Verify WindowDoesNotAcceptFocus and WA_ShowWithoutActivating so games never Alt-Tab
+            self.assertTrue(bool(studio.overlay_hud.windowFlags() & aot.Qt.WindowDoesNotAcceptFocus))
+            self.assertTrue(studio.overlay_hud.testAttribute(aot.Qt.WA_ShowWithoutActivating))
+
+            # 2. Verify F7 Combat Quick-Hide preserves existing blocks while hiding HUD
+            studio.overlay_hud.blocks = [{"text": "Hồi sinh tại đền", "rect": (10, 10, 120, 25), "raw": "Respawn at shrine"}]
+            self.assertFalse(studio.overlay_hud.is_hidden_by_user)
+            studio.toggle_overlay_visibility()
+            self.assertTrue(studio.overlay_hud.is_hidden_by_user)
+            self.assertEqual(len(studio.overlay_hud.blocks), 1)
+            studio.toggle_overlay_visibility()
+            self.assertFalse(studio.overlay_hud.is_hidden_by_user)
+
+            # 3. Verify Compact Gaming Mode collapses settings cards and locks HUD click-through
+            self.assertFalse(studio.is_compact_gaming_mode)
+            studio.toggle_compact_gaming_mode()
+            self.assertTrue(studio.is_compact_gaming_mode)
+            self.assertTrue(studio.card_lang.isHidden())
+            self.assertTrue(studio.card_ai.isHidden())
+            self.assertTrue(studio.overlay_hud.is_locked)
+            studio.toggle_compact_gaming_mode()
+            self.assertFalse(studio.is_compact_gaming_mode)
+            self.assertFalse(studio.card_lang.isHidden())
+
+            # 4. Verify Pixel-Delta Frame Signature comparison
+            from PIL import Image
+            img1 = Image.new("RGB", (200, 80), (20, 25, 35))
+            img2 = Image.new("RGB", (200, 80), (20, 25, 35))
+            img3 = Image.new("RGB", (200, 80), (220, 210, 190))
+            sig1 = studio.compute_frame_signature(img1)
+            sig2 = studio.compute_frame_signature(img2)
+            sig3 = studio.compute_frame_signature(img3)
+            self.assertEqual(studio.frame_signature_diff(sig1, sig2), 0.0)
+            self.assertGreater(studio.frame_signature_diff(sig1, sig3), 100.0)
+
+            # 5. Verify empty scene resets last_raw_text so repeated NPC dialogue re-translates
+            studio.last_raw_text = "Hello Traveler"
+            studio._on_translation_done([], "No text")
+            self.assertEqual(studio.last_raw_text, "")
+            studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

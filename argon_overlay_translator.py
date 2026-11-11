@@ -1600,6 +1600,7 @@ class FloatingOverlayHUD(QWidget):
         self.is_locked = False
         self.is_fullscreen = False
         self.is_capturing = False
+        self.is_hidden_by_user = False
         self.resizing = False
         self.resize_edge = ""
         self.resize_start_rect = None
@@ -1615,9 +1616,13 @@ class FloatingOverlayHUD(QWidget):
         self.bg_opacity = 95           # 0..100 (%)
 
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setGeometry(350, 280, 560, 220)
         self.setMouseTracking(True)
 
@@ -1627,12 +1632,20 @@ class FloatingOverlayHUD(QWidget):
         size = self.size()
         if locked:
             self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput
+                Qt.FramelessWindowHint
+                | Qt.WindowStaysOnTopHint
+                | Qt.Tool
+                | Qt.WindowDoesNotAcceptFocus
+                | Qt.WindowTransparentForInput
             )
         else:
             self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                Qt.FramelessWindowHint
+                | Qt.WindowStaysOnTopHint
+                | Qt.Tool
+                | Qt.WindowDoesNotAcceptFocus
             )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setGeometry(pos.x(), pos.y(), size.width(), size.height())
         self.show()
         self.update()
@@ -1670,8 +1683,9 @@ class FloatingOverlayHUD(QWidget):
         return QColor(248, 250, 252, 255), QColor(11, 15, 25, 230)
 
     def paintEvent(self, event):
-        if self.is_capturing:
+        if self.is_capturing or self.is_hidden_by_user:
             return
+
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -2455,6 +2469,7 @@ class HotkeyBridge(QObject):
     trigger_translate = pyqtSignal()
     trigger_lock = pyqtSignal()
     trigger_snip = pyqtSignal()
+    trigger_toggle_hide = pyqtSignal()
 
 
 DEFAULT_REPO_URL = "https://github.com/HocTrinh-dev/overlay-translater.git"
@@ -2477,6 +2492,7 @@ class MainStudioWindow(QWidget):
         self.update_url = DEFAULT_UPDATE_URL
         self.auto_update_on_start = True
         self.saved_region_rect = QRect(350, 280, 560, 220)
+        self.is_compact_gaming_mode = False
 
         self.setWindowTitle("Argon Context Overlay Translator")
         self.setMinimumWidth(540)
@@ -2489,11 +2505,13 @@ class MainStudioWindow(QWidget):
         self.worker = None
         self.update_worker = None
         self.last_raw_text = ""
+        self.last_frame_sig = None
 
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.trigger_translate.connect(self.initiate_capture_and_translate)
         self.hotkey_bridge.trigger_lock.connect(self.toggle_lock_mode)
         self.hotkey_bridge.trigger_snip.connect(self.start_snip_region)
+        self.hotkey_bridge.trigger_toggle_hide.connect(self.toggle_overlay_visibility)
 
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self.initiate_capture_and_translate)
@@ -2653,6 +2671,12 @@ class MainStudioWindow(QWidget):
         header_box.addWidget(lbl_sub)
         header_row.addLayout(header_box, 1)
 
+        self.btn_gaming_mode = QPushButton("🎮 Chế độ Game")
+        self.btn_gaming_mode.setObjectName("SecondaryBtn")
+        self.btn_gaming_mode.setToolTip("Thu gọn bảng điều khiển thành thanh Mini-Bar nổi trên game & tự khóa xuyên chuột HUD")
+        self.btn_gaming_mode.clicked.connect(self.toggle_compact_gaming_mode)
+        header_row.addWidget(self.btn_gaming_mode)
+
         self.btn_update = QPushButton("🔄 Hot Update")
         self.btn_update.setObjectName("SecondaryBtn")
         self.btn_update.setToolTip("Left-click: Pull latest code from GitHub & reload\nShift+Click: Set GitHub repository URL")
@@ -2661,6 +2685,7 @@ class MainStudioWindow(QWidget):
         root.addLayout(header_row)
 
         card_lang = QFrame()
+        self.card_lang = card_lang
         card_lang.setObjectName("Card")
         c1_layout = QVBoxLayout(card_lang)
         c1_layout.setContentsMargins(16, 14, 16, 16)
@@ -2865,6 +2890,7 @@ class MainStudioWindow(QWidget):
         root.addWidget(card_lang)
 
         card_ai = QFrame()
+        self.card_ai = card_ai
         card_ai.setObjectName("Card")
         c2_layout = QVBoxLayout(card_ai)
         c2_layout.setContentsMargins(16, 14, 16, 16)
@@ -2913,23 +2939,29 @@ class MainStudioWindow(QWidget):
         root.addWidget(card_ai)
 
         row_btns = QHBoxLayout()
-        row_btns.setSpacing(10)
+        row_btns.setSpacing(8)
         self.btn_lock = QPushButton("🔓 Lock (F10)")
         self.btn_lock.setObjectName("SecondaryBtn")
         self.btn_lock.clicked.connect(self.toggle_lock_mode)
+
+        self.btn_hide_overlay = QPushButton("👁️ Ẩn/Hiện (F7)")
+        self.btn_hide_overlay.setObjectName("SecondaryBtn")
+        self.btn_hide_overlay.setToolTip("Ẩn/Hiện tức thì khung dịch khi đang giao tranh trong game (F7)")
+        self.btn_hide_overlay.clicked.connect(self.toggle_overlay_visibility)
 
         self.btn_codex = QPushButton("📚 Bách Khoa && Kho Dịch")
         self.btn_codex.setObjectName("SecondaryBtn")
         self.btn_codex.setToolTip("Mở Bách Khoa Toàn Thư Game (Codex) & Bộ Nhớ Câu Đã Dịch (Cache)")
         self.btn_codex.clicked.connect(self.open_codex_and_cache_dialog)
 
-        self.btn_clear = QPushButton("Clear Overlay")
+        self.btn_clear = QPushButton("Clear")
         self.btn_clear.setObjectName("SecondaryBtn")
         self.btn_clear.clicked.connect(self.clear_overlay_text)
 
         row_btns.addWidget(self.btn_lock, 1)
+        row_btns.addWidget(self.btn_hide_overlay, 1)
         row_btns.addWidget(self.btn_codex, 1)
-        row_btns.addWidget(self.btn_clear, 1)
+        row_btns.addWidget(self.btn_clear, 0)
         root.addLayout(row_btns)
 
         self.btn_translate = QPushButton("⚡ Scan && Translate Selected Region (F9)")
@@ -2937,7 +2969,7 @@ class MainStudioWindow(QWidget):
         self.btn_translate.clicked.connect(self.initiate_capture_and_translate)
         root.addWidget(self.btn_translate)
 
-        self.lbl_status = QLabel("Ready • F8: Chọn khung • F9: Dịch • F10: Khóa • 📚 Bách Khoa & Cache")
+        self.lbl_status = QLabel("Ready • F7: Ẩn/Hiện • F8: Chọn khung • F9: Dịch • F10: Khóa")
         self.lbl_status.setObjectName("StatusPill")
         root.addWidget(self.lbl_status)
 
@@ -3284,6 +3316,7 @@ class MainStudioWindow(QWidget):
     def _register_global_hotkeys(self):
         def listen():
             try:
+                keyboard.add_hotkey('F7', lambda: self.hotkey_bridge.trigger_toggle_hide.emit())
                 keyboard.add_hotkey('F8', lambda: self.hotkey_bridge.trigger_snip.emit())
                 keyboard.add_hotkey('F9', lambda: self.hotkey_bridge.trigger_translate.emit())
                 keyboard.add_hotkey('F10', lambda: self.hotkey_bridge.trigger_lock.emit())
@@ -3291,6 +3324,45 @@ class MainStudioWindow(QWidget):
                 print(f"Global hotkey registration warning: {e}")
 
         threading.Thread(target=listen, daemon=True).start()
+
+    def toggle_overlay_visibility(self):
+        """
+        Instant 0ms Combat Quick-Hide (F7): hides/restores the overlay HUD without clearing
+        translated blocks so gamers can fight bosses unobstructed and bring text back immediately.
+        """
+        self.overlay_hud.is_hidden_by_user = not self.overlay_hud.is_hidden_by_user
+        self.overlay_hud.update()
+        if self.overlay_hud.is_hidden_by_user:
+            self.btn_hide_overlay.setText("🙈 Đang Ẩn (F7)")
+            self.lbl_status.setText("🙈 Đã tạm ẩn khung dịch (Bấm F7 để hiện lại ngay lập tức).")
+        else:
+            self.btn_hide_overlay.setText("👁️ Ẩn/Hiện (F7)")
+            self.lbl_status.setText("👁️ Đã hiện lại khung dịch.")
+
+    def toggle_compact_gaming_mode(self):
+        """
+        Collapse the full configuration cards into a compact Always-On-Top In-Game Mini-Bar
+        and automatically lock the HUD into Click-Through mode so it never interferes with gameplay.
+        """
+        self.is_compact_gaming_mode = not self.is_compact_gaming_mode
+        if self.is_compact_gaming_mode:
+            self.card_lang.hide()
+            self.card_ai.hide()
+            if not self.overlay_hud.is_locked:
+                self.overlay_hud.set_locked(True)
+                self.btn_lock.setText("🔒 Locked (F10)")
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+            self.btn_gaming_mode.setText("🔽 Mở rộng Setting")
+            self.lbl_status.setText("🎮 Chế độ Game: Đã khóa xuyên chuột HUD • F7: Ẩn/Hiện • F8: Kéo khung • F9: Dịch")
+        else:
+            self.card_lang.show()
+            self.card_ai.show()
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+            self.btn_gaming_mode.setText("🎮 Chế độ Game")
+            self.lbl_status.setText("Ready • F7: Ẩn/Hiện • F8: Chọn khung • F9: Dịch • F10: Khóa")
+        self.show()
+        self.adjustSize()
+        self.setFixedSize(self.sizeHint().width(), self.sizeHint().height())
 
     def toggle_lock_mode(self):
         new_state = not self.overlay_hud.is_locked
@@ -3305,6 +3377,7 @@ class MainStudioWindow(QWidget):
     def clear_overlay_text(self):
         self.overlay_hud.blocks = []
         self.last_raw_text = ""
+        self.last_frame_sig = None
         self.overlay_hud.update()
         self.lbl_status.setText("Cleared overlay translation blocks.")
 
@@ -3315,6 +3388,21 @@ class MainStudioWindow(QWidget):
         else:
             self.auto_timer.stop()
             self.lbl_status.setText("Auto-scan disabled.")
+
+    @staticmethod
+    def compute_frame_signature(pil_img) -> tuple:
+        """
+        Compute a lightweight 16x8 RGB thumbnail signature in <0.2ms so Auto-Scan can
+        detect unchanged game frames and skip expensive Tesseract OCR invocations.
+        """
+        thumb = pil_img.resize((16, 8), Image.NEAREST).convert("RGB")
+        return tuple(thumb.tobytes())
+
+    @staticmethod
+    def frame_signature_diff(sig1: tuple, sig2: tuple) -> float:
+        if not sig1 or not sig2 or len(sig1) != len(sig2):
+            return 999.0
+        return sum(abs(a - b) for a, b in zip(sig1, sig2)) / len(sig1)
 
     def initiate_capture_and_translate(self):
         if self.worker and self.worker.isRunning():
@@ -3360,6 +3448,18 @@ class MainStudioWindow(QWidget):
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
+        # Fast Pixel-Delta Skip during Auto-Scan: if screen pixels haven't changed, skip Tesseract OCR to save CPU/FPS
+        new_sig = self.compute_frame_signature(pil_img)
+        if (
+            self.chk_auto.isChecked()
+            and self.overlay_hud.blocks
+            and self.last_frame_sig is not None
+            and self.frame_signature_diff(new_sig, self.last_frame_sig) < 1.5
+        ):
+            self.lbl_status.setText("⚡ Khung hình game không đổi (Bỏ qua OCR để giữ mượt FPS)")
+            return
+        self.last_frame_sig = new_sig
+
         src_selection = self.cb_src.currentText()
         tess_lang = resolve_ocr_lang_string(src_selection)
         target_lang = self.cb_dst.currentText()
@@ -3386,6 +3486,8 @@ class MainStudioWindow(QWidget):
             self.overlay_hud.blocks = blocks
             if blocks:
                 self.last_raw_text = blocks[0]['raw']
+            else:
+                self.last_raw_text = ""
             self.overlay_hud.update()
         self.lbl_status.setText(status_msg)
 
