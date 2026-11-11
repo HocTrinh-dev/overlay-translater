@@ -1783,6 +1783,12 @@ class FloatingOverlayHUD(QWidget):
             )
             draw_w = max(orig_lw, min(text_rect.width() + 12, w - lx - 2))
             draw_h = max(orig_lh, text_rect.height() + 4)
+            b['painted_phys_rect'] = (
+                max(0, int((lx - 6) * self.dpr)),
+                max(0, int((ly - 4) * self.dpr)),
+                int((draw_w + 12) * self.dpr),
+                int((draw_h + 8) * self.dpr)
+            )
 
             if self.overlay_style == "replace":
                 # 1. Erase original foreign text on image using chameleon sampled background color (zero border)
@@ -1934,10 +1940,15 @@ class FloatingOverlayHUD(QWidget):
         if self.is_locked or self.is_fullscreen:
             return
         if self.resizing and (event.buttons() & Qt.LeftButton):
+            if self.blocks:
+                self.blocks = []
             self._apply_resize_drag(event.globalPos())
             event.accept()
             return
         if self.drag_offset and (event.buttons() & Qt.LeftButton):
+            if self.blocks:
+                self.blocks = []
+                self.update()
             self.move(event.globalPos() - self.drag_offset)
             event.accept()
             return
@@ -2470,6 +2481,7 @@ class HotkeyBridge(QObject):
     trigger_lock = pyqtSignal()
     trigger_snip = pyqtSignal()
     trigger_toggle_hide = pyqtSignal()
+    trigger_tab_switched = pyqtSignal()
 
 
 DEFAULT_REPO_URL = "https://github.com/HocTrinh-dev/overlay-translater.git"
@@ -2506,15 +2518,22 @@ class MainStudioWindow(QWidget):
         self.update_worker = None
         self.last_raw_text = ""
         self.last_frame_sig = None
+        self.active_scene_sig = None
+        self.last_captured_pil_img = None
 
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.trigger_translate.connect(self.initiate_capture_and_translate)
         self.hotkey_bridge.trigger_lock.connect(self.toggle_lock_mode)
         self.hotkey_bridge.trigger_snip.connect(self.start_snip_region)
         self.hotkey_bridge.trigger_toggle_hide.connect(self.toggle_overlay_visibility)
+        self.hotkey_bridge.trigger_tab_switched.connect(self.on_scene_or_tab_changed)
 
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self.initiate_capture_and_translate)
+
+        self.scene_watch_timer = QTimer(self)
+        self.scene_watch_timer.setInterval(260)
+        self.scene_watch_timer.timeout.connect(self._check_scene_or_tab_change)
 
         self._apply_stylesheet()
         self._build_ui()
@@ -2522,6 +2541,7 @@ class MainStudioWindow(QWidget):
         self.setFixedSize(self.sizeHint().width(), self.sizeHint().height())
         self.load_config()
         self._register_global_hotkeys()
+        self.scene_watch_timer.start()
 
         self.overlay_hud.show()
 
@@ -2874,17 +2894,26 @@ class MainStudioWindow(QWidget):
         c1_layout.addLayout(row_typo2)
 
         row_auto = QHBoxLayout()
-        self.chk_auto = QCheckBox("Auto-scan && translate every:")
+        self.chk_auto = QCheckBox("Auto-scan every:")
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
         self.sp_interval = QSpinBox()
         self.sp_interval.setFixedHeight(36)
-        self.sp_interval.setMinimumWidth(85)
+        self.sp_interval.setMinimumWidth(80)
         self.sp_interval.setRange(2, 30)
         self.sp_interval.setValue(3)
         self.sp_interval.setSuffix(" sec")
+
+        self.chk_auto_clear = QCheckBox("🧹 Tự xóa khi chuyển Tab")
+        self.chk_auto_clear.setChecked(True)
+        self.chk_auto_clear.setToolTip(
+            "Tự động xóa ngay chữ dịch cũ trên màn hình khi bạn chuyển Tab, cuộn trang hoặc đổi cửa sổ để không bị rối mắt"
+        )
+
         row_auto.addWidget(self.chk_auto)
-        row_auto.addStretch()
         row_auto.addWidget(self.sp_interval)
+        row_auto.addSpacing(10)
+        row_auto.addWidget(self.chk_auto_clear)
+        row_auto.addStretch()
         c1_layout.addLayout(row_auto)
 
         root.addWidget(card_lang)
@@ -3149,6 +3178,9 @@ class MainStudioWindow(QWidget):
             if "auto_font_fit" in cfg and isinstance(cfg["auto_font_fit"], bool):
                 self.chk_auto_font.setChecked(cfg["auto_font_fit"])
 
+            if "auto_clear_on_change" in cfg and isinstance(cfg["auto_clear_on_change"], bool):
+                self.chk_auto_clear.setChecked(cfg["auto_clear_on_change"])
+
             self.on_typography_changed()
 
             if "update_url" in cfg and isinstance(cfg["update_url"], str):
@@ -3170,6 +3202,7 @@ class MainStudioWindow(QWidget):
             "src_lang": self.cb_src.currentText(),
             "dst_lang": self.cb_dst.currentText(),
             "auto_interval": self.sp_interval.value(),
+            "auto_clear_on_change": self.chk_auto_clear.isChecked(),
             "capture_mode": "fullscreen" if self.cb_mode.currentIndex() == 1 else "region",
             "overlay_style": style_map.get(self.cb_overlay_style.currentIndex(), "replace"),
             "font_family": self.cb_font_family.currentText(),
@@ -3285,6 +3318,7 @@ class MainStudioWindow(QWidget):
                 new_cls = reload_ns.get("MainStudioWindow")
                 if new_cls is not None:
                     self.auto_timer.stop()
+                    self.scene_watch_timer.stop()
                     try:
                         keyboard.unhook_all()
                     except Exception:
@@ -3320,6 +3354,11 @@ class MainStudioWindow(QWidget):
                 keyboard.add_hotkey('F8', lambda: self.hotkey_bridge.trigger_snip.emit())
                 keyboard.add_hotkey('F9', lambda: self.hotkey_bridge.trigger_translate.emit())
                 keyboard.add_hotkey('F10', lambda: self.hotkey_bridge.trigger_lock.emit())
+                for nav_key in ('alt+tab', 'ctrl+tab', 'ctrl+shift+tab', 'ctrl+w', 'ctrl+t', 'page up', 'page down'):
+                    try:
+                        keyboard.add_hotkey(nav_key, lambda: self.hotkey_bridge.trigger_tab_switched.emit(), suppress=False)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Global hotkey registration warning: {e}")
 
@@ -3378,8 +3417,26 @@ class MainStudioWindow(QWidget):
         self.overlay_hud.blocks = []
         self.last_raw_text = ""
         self.last_frame_sig = None
+        self.active_scene_sig = None
         self.overlay_hud.update()
         self.lbl_status.setText("Cleared overlay translation blocks.")
+
+    def on_scene_or_tab_changed(self):
+        """
+        Automatically wipe stale overlay translation blocks the instant the user switches tabs,
+        scrolls, or changes windows/menus so old translations never clutter the new screen.
+        If Auto-Scan is enabled, immediately schedule a fresh scan of the new tab.
+        """
+        if not self.chk_auto_clear.isChecked() or not self.overlay_hud.blocks:
+            return
+        self.overlay_hud.blocks = []
+        self.last_raw_text = ""
+        self.last_frame_sig = None
+        self.active_scene_sig = None
+        self.overlay_hud.update()
+        self.lbl_status.setText("🧹 Đã tự xóa Overlay do chuyển Tab / đổi nội dung màn hình.")
+        if self.chk_auto.isChecked() and not (self.worker and self.worker.isRunning()):
+            QTimer.singleShot(220, self.initiate_capture_and_translate)
 
     def toggle_auto_timer(self, state):
         if state == Qt.Checked:
@@ -3403,6 +3460,129 @@ class MainStudioWindow(QWidget):
         if not sig1 or not sig2 or len(sig1) != len(sig2):
             return 999.0
         return sum(abs(a - b) for a, b in zip(sig1, sig2)) / len(sig1)
+
+    @staticmethod
+    def compute_unmasked_scene_signature(pil_img, blocks: list, top_strip_img=None) -> tuple:
+        """
+        Sample a 20x12 grid of background pixels inside `pil_img` that lie OUTSIDE any painted
+        overlay text block (`painted_phys_rect` / `rect`), plus an optional top-of-screen tab-bar strip.
+        Because unmasked pixels are transparent in the HUD, this signature can be checked live
+        every 260ms without hiding or flickering the overlay!
+        """
+        if pil_img is None:
+            return ()
+        img_w, img_h = pil_img.size
+        if img_w < 32 or img_h < 32:
+            return ()
+
+        masked_rects = []
+        for b in (blocks or []):
+            if "painted_phys_rect" in b:
+                px, py, pw, ph = b["painted_phys_rect"]
+                masked_rects.append((px - 4, py - 4, px + pw + 8, py + ph + 8))
+            elif "rect" in b:
+                rx, ry, rw, rh = b["rect"]
+                masked_rects.append((rx - 10, ry - 8, rx + rw + 180, ry + rh + 48))
+
+        samples = []
+        margin_x = min(14, img_w // 6)
+        margin_y = min(14, img_h // 6)
+        usable_w = max(1, img_w - 2 * margin_x)
+        usable_h = max(1, img_h - 2 * margin_y)
+
+        for gy in range(12):
+            sy = margin_y + int((gy + 0.5) * usable_h / 12)
+            sy = max(0, min(img_h - 1, sy))
+            for gx in range(20):
+                sx = margin_x + int((gx + 0.5) * usable_w / 20)
+                sx = max(0, min(img_w - 1, sx))
+                covered = False
+                for mx0, my0, mx1, my1 in masked_rects:
+                    if mx0 <= sx <= mx1 and my0 <= sy <= my1:
+                        covered = True
+                        break
+                if not covered:
+                    r, g, b_val = pil_img.getpixel((sx, sy))[:3]
+                    samples.extend((r, g, b_val))
+
+        if top_strip_img is not None:
+            try:
+                strip_thumb = top_strip_img.resize((24, 2), Image.NEAREST).convert("RGB")
+                samples.extend(strip_thumb.tobytes())
+            except Exception:
+                pass
+
+        return tuple(samples)
+
+    def _grab_live_unmasked_signature(self) -> tuple:
+        """
+        Grab the current HUD region (and top tab-bar strip if not obscured) without hiding the HUD,
+        returning the unmasked pixel signature for real-time tab/scene change detection.
+        """
+        geo = self.overlay_hud.geometry()
+        screen = QApplication.screenAt(geo.center()) or QApplication.primaryScreen()
+        dpr = screen.devicePixelRatio()
+        self.overlay_hud.dpr = dpr
+
+        phys_x = int(geo.x() * dpr)
+        phys_y = int(geo.y() * dpr)
+        phys_w = int(geo.width() * dpr)
+        phys_h = int(geo.height() * dpr)
+
+        try:
+            with mss.mss() as sct:
+                monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
+                sct_img = sct.grab(monitor)
+                pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+                top_strip_img = None
+                if not self.overlay_hud.is_fullscreen:
+                    scr_geo = screen.geometry()
+                    strip_rect = QRect(scr_geo.x() + 120, scr_geo.y() + 4, max(200, scr_geo.width() - 360), 38)
+                    if not strip_rect.intersects(geo) and not strip_rect.intersects(self.frameGeometry()):
+                        s_mon = {
+                            "left": int(strip_rect.x() * dpr),
+                            "top": int(strip_rect.y() * dpr),
+                            "width": int(strip_rect.width() * dpr),
+                            "height": int(strip_rect.height() * dpr)
+                        }
+                        s_raw = sct.grab(s_mon)
+                        top_strip_img = Image.frombytes("RGB", s_raw.size, s_raw.bgra, "raw", "BGRX")
+        except Exception:
+            return ()
+
+        return self.compute_unmasked_scene_signature(pil_img, self.overlay_hud.blocks, top_strip_img)
+
+    def _refresh_active_scene_signature(self):
+        if self.overlay_hud.blocks and not self.overlay_hud.is_capturing:
+            sig = self._grab_live_unmasked_signature()
+            if sig:
+                self.active_scene_sig = sig
+
+    def _check_scene_or_tab_change(self):
+        """
+        Periodic 260ms non-intrusive check: if the user switched browser/game tabs, scrolled,
+        or changed windows while translation pills are on screen, clear the stale overlay immediately.
+        """
+        if (
+            not self.chk_auto_clear.isChecked()
+            or not self.overlay_hud.blocks
+            or self.overlay_hud.is_capturing
+            or self.overlay_hud.is_hidden_by_user
+            or (self.worker and self.worker.isRunning())
+        ):
+            return
+
+        live_sig = self._grab_live_unmasked_signature()
+        if not live_sig:
+            return
+
+        if not self.active_scene_sig or len(live_sig) != len(self.active_scene_sig):
+            self.active_scene_sig = live_sig
+            return
+
+        if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 4.0:
+            self.on_scene_or_tab_changed()
 
     def initiate_capture_and_translate(self):
         if self.worker and self.worker.isRunning():
@@ -3442,19 +3622,33 @@ class MainStudioWindow(QWidget):
             self.lbl_status.setText(f"Screen grab error: {e}")
             return
 
-        # Phase 2: Immediately restore overlay and Studio window state
+        self.last_captured_pil_img = pil_img
+        new_sig = self.compute_frame_signature(pil_img)
+        frame_diff = (
+            self.frame_signature_diff(new_sig, self.last_frame_sig)
+            if self.last_frame_sig is not None
+            else 999.0
+        )
+
+        # Critical Fix: If the screen/tab changed, clear old overlay blocks BEFORE un-hiding HUD
+        # so the previous tab's blocks NEVER flash or linger on top of the new tab while OCR runs!
+        if frame_diff >= 1.5 and self.overlay_hud.blocks:
+            self.overlay_hud.blocks = []
+            self.last_raw_text = ""
+            self.active_scene_sig = None
+
+        # Phase 2: Restore overlay and Studio window state
         self.overlay_hud.is_capturing = False
         if self.overlay_hud.is_fullscreen:
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
         # Fast Pixel-Delta Skip during Auto-Scan: if screen pixels haven't changed, skip Tesseract OCR to save CPU/FPS
-        new_sig = self.compute_frame_signature(pil_img)
         if (
             self.chk_auto.isChecked()
             and self.overlay_hud.blocks
             and self.last_frame_sig is not None
-            and self.frame_signature_diff(new_sig, self.last_frame_sig) < 1.5
+            and frame_diff < 1.5
         ):
             self.lbl_status.setText("⚡ Khung hình game không đổi (Bỏ qua OCR để giữ mượt FPS)")
             return
@@ -3488,13 +3682,23 @@ class MainStudioWindow(QWidget):
                 self.last_raw_text = blocks[0]['raw']
             else:
                 self.last_raw_text = ""
-            self.overlay_hud.update()
+                self.active_scene_sig = None
+            self.overlay_hud.repaint()
+            if blocks:
+                if self.last_captured_pil_img is not None:
+                    self.active_scene_sig = self.compute_unmasked_scene_signature(
+                        self.last_captured_pil_img,
+                        self.overlay_hud.blocks
+                    )
+                QTimer.singleShot(60, self._refresh_active_scene_signature)
         self.lbl_status.setText(status_msg)
 
     def _on_translation_error(self, err_msg):
         self.lbl_status.setText(err_msg)
 
     def closeEvent(self, event):
+        self.auto_timer.stop()
+        self.scene_watch_timer.stop()
         self.save_config()
         if self.codex_dialog:
             self.codex_dialog.close()

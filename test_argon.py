@@ -639,6 +639,47 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             self.assertEqual(studio.last_raw_text, "")
             studio.close()
 
+    def test_auto_clear_overlay_on_tab_or_scene_switch(self):
+        """Verify overlay automatically clears when switching tabs/windows or changing unmasked scene pixels."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = os.path.join(tmpdir, "autoclear_config.json")
+            studio = aot.MainStudioWindow(config_path=cfg_path)
+            self.assertTrue(studio.chk_auto_clear.isChecked())
+
+            blocks = [{
+                "text": "Nhiệm vụ chính",
+                "rect": (30, 30, 100, 22),
+                "painted_phys_rect": (25, 25, 115, 32),
+                "raw": "Main Quest"
+            }]
+            studio.overlay_hud.blocks = list(blocks)
+            studio.last_raw_text = "Main Quest"
+
+            # 1. Verify compute_unmasked_scene_signature ignores changes inside painted_phys_rect
+            from PIL import Image, ImageDraw
+            img_tab1 = Image.new("RGB", (300, 160), (24, 30, 44))
+            img_tab1_pill_drawn = img_tab1.copy()
+            draw = ImageDraw.Draw(img_tab1_pill_drawn)
+            draw.rectangle([28, 28, 130, 52], fill=(255, 255, 0))
+
+            sig_before_pill = studio.compute_unmasked_scene_signature(img_tab1, blocks)
+            sig_after_pill = studio.compute_unmasked_scene_signature(img_tab1_pill_drawn, blocks)
+            self.assertEqual(studio.frame_signature_diff(sig_before_pill, sig_after_pill), 0.0)
+
+            # 2. Verify switching to another tab (background/tab-bar changes) triggers automatic overlay clear
+            img_tab2 = Image.new("RGB", (300, 160), (235, 240, 248))
+            sig_tab2 = studio.compute_unmasked_scene_signature(img_tab2, blocks)
+            self.assertGreater(studio.frame_signature_diff(sig_before_pill, sig_tab2), 100.0)
+
+            studio.active_scene_sig = sig_before_pill
+            with unittest.mock.patch.object(studio, "_grab_live_unmasked_signature", return_value=sig_tab2):
+                studio._check_scene_or_tab_change()
+
+            self.assertEqual(studio.overlay_hud.blocks, [])
+            self.assertEqual(studio.last_raw_text, "")
+            self.assertIsNone(studio.active_scene_sig)
+            studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
