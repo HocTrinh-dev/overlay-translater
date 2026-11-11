@@ -348,6 +348,32 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             aot.is_already_target_language("[World] 龙傲天: 组队刷副本", "Vietnamese")
         )
 
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    @patch("argon_overlay_translator.keyboard.unhook_all")
+    def test_in_process_hot_reload_and_clean_pyinstaller_env(self, mock_unhook, mock_hotkey):
+        """Verify Hot Update reloads in-process without Qt platform plugin crash, and strips _MEIPASS/QT_PLUGIN_PATH."""
+        with patch.dict(
+            os.environ,
+            {
+                "_MEIPASS2": r"C:\Temp\_MEI12345",
+                "QT_PLUGIN_PATH": r"C:\Temp\_MEI12345\PyQt5\Qt5\plugins",
+                "QT_QPA_PLATFORM_PLUGIN_PATH": r"C:\Temp\_MEI12345\PyQt5\Qt5\plugins\platforms",
+            },
+        ):
+            clean_env = aot.MainStudioWindow._build_clean_subprocess_env()
+            self.assertNotIn("_MEIPASS2", clean_env)
+            self.assertNotIn("QT_PLUGIN_PATH", clean_env)
+            self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", clean_env)
+
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        with patch("argon_overlay_translator.subprocess.Popen") as mock_popen:
+            studio._restart_process()
+            # In-process hot reload should succeed without spawning a child .exe process!
+            mock_popen.assert_not_called()
+            app = aot.QApplication.instance()
+            self.assertIsNotNone(getattr(app, "_active_studio", None))
+            app._active_studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

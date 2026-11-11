@@ -24,8 +24,9 @@ from PyQt5.QtWidgets import (
 )
 
 # High-DPI synchronization for 125% / 150% / 4K Windows displays
-QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+if QApplication.instance() is None:
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(DEFAULT_TESSERACT):
@@ -2022,12 +2023,82 @@ class MainStudioWindow(QWidget):
         self.lbl_status.setText(message)
         if should_restart:
             self.save_config()
-            self.overlay_hud.close()
-            QTimer.singleShot(350, self._restart_process)
+            QTimer.singleShot(250, self._restart_process)
+
+    @staticmethod
+    def _build_clean_subprocess_env() -> dict:
+        """
+        Remove PyInstaller onefile temporary directory variables (_MEIPASS2, QT_PLUGIN_PATH, etc.)
+        so a spawned child ArgonTranslator.exe never points to the parent's deleted _MEIxxxxxx folder.
+        """
+        env = os.environ.copy()
+        for key in (
+            "_MEIPASS",
+            "_MEIPASS2",
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QML2_IMPORT_PATH",
+            "TCL_LIBRARY",
+            "TK_LIBRARY",
+        ):
+            env.pop(key, None)
+
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass and "PATH" in env:
+            norm_mei = os.path.normcase(os.path.abspath(meipass))
+            clean_paths = [
+                p for p in env["PATH"].split(os.pathsep)
+                if p and not os.path.normcase(os.path.abspath(p)).startswith(norm_mei)
+            ]
+            env["PATH"] = os.pathsep.join(clean_paths)
+        return env
 
     def _restart_process(self):
+        """
+        Hot-reload `argon_overlay_translator.py` directly in-process inside the active QApplication
+        (avoiding PyInstaller onefile _MEIxxxxxx temp folder deletion & Qt platform plugin errors).
+        Falls back to a clean-env subprocess spawn only if in-process reload fails.
+        """
+        try:
+            if os.path.exists(MAIN_SCRIPT_FILE):
+                with open(MAIN_SCRIPT_FILE, "r", encoding="utf-8") as f:
+                    source_code = f.read()
+
+                code_obj = compile(source_code, MAIN_SCRIPT_FILE, "exec")
+                reload_ns = {
+                    "__name__": "__argon_hot_reload__",
+                    "__file__": MAIN_SCRIPT_FILE,
+                }
+                exec(code_obj, reload_ns)
+                new_cls = reload_ns.get("MainStudioWindow")
+                if new_cls is not None:
+                    self.auto_timer.stop()
+                    try:
+                        keyboard.unhook_all()
+                    except Exception:
+                        pass
+                    if self.codex_dialog:
+                        self.codex_dialog.close()
+                    self.snipper.close()
+                    self.overlay_hud.close()
+                    self.hide()
+
+                    new_studio = new_cls(config_path=self.config_path)
+                    app = QApplication.instance()
+                    if app is not None:
+                        app._active_studio = new_studio
+                    new_studio.show()
+                    new_studio.raise_()
+                    new_studio.activateWindow()
+                    new_studio.lbl_status.setText("✓ Đã Hot Update thành công! (Áp dụng ngay không cần mở lại .exe)")
+                    self.deleteLater()
+                    return
+        except Exception as e:
+            print(f"In-process hot reload warning (falling back to clean process restart): {e}")
+
+        self.overlay_hud.close()
         args = [sys.executable] + (sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv)
-        subprocess.Popen(args, cwd=APP_DIR)
+        subprocess.Popen(args, cwd=APP_DIR, env=self._build_clean_subprocess_env())
         QApplication.quit()
 
     def _register_global_hotkeys(self):
