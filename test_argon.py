@@ -507,6 +507,59 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0][0][0]["text"], "Chiến Thắng")
 
+    def test_skip_numbers_and_special_characters_in_ocr(self):
+        """Verify numbers, percentages, stat counters, and special symbols are stripped and skipped."""
+        self.assertTrue(aot.is_symbol_or_number_only("12345"))
+        self.assertTrue(aot.is_symbol_or_number_only("1500 / 2000 +25%"))
+        self.assertTrue(aot.is_symbol_or_number_only("Lv.99 x10 60FPS"))
+        self.assertTrue(aot.is_symbol_or_number_only("@#$%^&* === --- ***"))
+        self.assertFalse(aot.is_symbol_or_number_only("Crimson Blade"))
+        self.assertFalse(aot.is_symbol_or_number_only("青云门"))
+
+        img = Image.new("RGB", (240, 80), color=(30, 30, 30))
+        mgr = aot.TranslationKnowledgeManager(
+            codex_path=os.path.join(self.temp_dir.name, "codex.json"),
+            cache_path=os.path.join(self.temp_dir.name, "cache.json"),
+        )
+        mgr.add_or_update_codex("Crimson Blade", "Huyết Kiếm")
+
+        # Line 1 is pure numbers/stats ('1500/2000', '+99%'), Line 2 has special chars + numbers around 'Crimson Blade'
+        ocr_result = {
+            "text": ["1500/2000", "+99%", "[14:30]", "***Crimson", "Blade###", "9999"],
+            "conf": ["95", "95", "95", "95", "95", "95"],
+            "left": [10, 80, 10, 60, 120, 180],
+            "top": [5, 5, 40, 40, 40, 40],
+            "width": [60, 40, 40, 55, 55, 40],
+            "height": [18, 18, 20, 20, 20, 20],
+            "block_num": [1, 1, 2, 2, 2, 2],
+            "par_num": [1, 1, 1, 1, 1, 1],
+            "line_num": [1, 1, 1, 1, 1, 1],
+        }
+        worker = aot.TranslationWorker(
+            pil_img=img,
+            tess_lang="eng",
+            target_lang="Vietnamese",
+            api_url="",
+            api_key="",
+            model_name="",
+            last_raw_text="",
+            knowledge_mgr=mgr,
+        )
+        results = []
+        worker.finished_signal.connect(lambda blocks, msg: results.append((blocks, msg)))
+
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=ocr_result):
+            worker.run()
+
+        self.assertEqual(len(results), 1)
+        blocks = results[0][0]
+        # Line 1 ('1500/2000 +99%') was completely skipped; Line 2 stripped '[14:30]', '***', '###', '9999' -> 'Crimson Blade'
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["raw_line"], "Crimson Blade")
+        self.assertEqual(blocks[0]["text"], "Huyết Kiếm")
+        # Bounding box x starts at 60 ('Crimson'), not 10 ('[14:30]'), and ends at 175 ('Blade'), not 220 ('9999')
+        self.assertEqual(blocks[0]["rect"], (60, 40, 115, 20))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

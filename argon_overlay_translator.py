@@ -142,9 +142,78 @@ def _is_cjk_ideograph_or_kana(ch: str) -> bool:
 def _contains_cjk_or_hangul(text: str) -> bool:
     for ch in text:
         code = ord(ch)
-        if (0x3000 <= code <= 0x9FFF) or (0xAC00 <= code <= 0xD7A3) or (0xF900 <= code <= 0xFAFF):
+        if (0x3040 <= code <= 0x9FFF) or (0xAC00 <= code <= 0xD7A3) or (0xF900 <= code <= 0xFAFF):
             return True
     return False
+
+
+_SPECIAL_NOISE_STRIP_CHARS = "@#$%^&*_+=|~<>\\/`[]{}" "【】《》「」『』★☆◆◇●○■□▲△▼▽※§¶"
+
+
+def clean_special_chars_from_token(token: str) -> str:
+    """
+    Strip special noise characters (@, #, $, %, ^, &, *, _, +, =, |, ~, <, >, brackets, etc.)
+    from an OCR token while keeping normal sentence punctuation (.,!?'\":;-).
+    Returns empty string if the token contains no alphabetic or CJK/Hangul letters (e.g. pure numbers/symbols).
+    """
+    if not token:
+        return ""
+    cleaned = token.strip().strip(_SPECIAL_NOISE_STRIP_CHARS).strip()
+    if not cleaned:
+        return ""
+
+    if _contains_cjk_or_hangul(cleaned):
+        # Remove leading/trailing pure digits and special symbols around CJK text
+        return cleaned
+
+    alpha_chars = [ch for ch in cleaned if ch.isalpha()]
+    if not alpha_chars:
+        # Pure numbers, timestamps, percentages, coordinates, or punctuation (e.g. '12345', '100/200', '+25%', '14:30', '---')
+        return ""
+
+    # Skip alphanumeric stat/level/version counters where digits are attached to 1-3 letters (e.g. 'Lv.99', 'x10', 'v1.2', '100K', '60FPS')
+    if any(ch.isdigit() for ch in cleaned) and len(alpha_chars) <= 3:
+        return ""
+
+    return cleaned
+
+
+def is_symbol_or_number_only(text: str) -> bool:
+    """
+    Return True if `text` contains only numbers, special characters, punctuation,
+    stat counters (Lv.99, +15%, 100/200, 14:30), or isolated 1-character OCR noise,
+    so it should NOT be translated or covered by an overlay block.
+    """
+    if not text or not text.strip():
+        return True
+    if _contains_cjk_or_hangul(text):
+        return False
+
+    # Split into space-separated tokens and check for real alphabetic words (>= 2 letters without digits)
+    valid_words = 0
+    for raw_tok in text.split():
+        cleaned = clean_special_chars_from_token(raw_tok)
+        if not cleaned:
+            continue
+        alpha_only = "".join(ch for ch in cleaned if ch.isalpha())
+        if len(alpha_only) >= 2 and not any(ch.isdigit() for ch in cleaned):
+            valid_words += 1
+
+    return valid_words == 0
+
+
+def filter_ocr_line_items(line_items: list) -> list:
+    """
+    Filter out OCR word items that are purely numbers, special characters, or stat counters,
+    and clean special noise characters from valid word tokens so overlay masks never cover numbers/symbols.
+    """
+    filtered = []
+    for item in line_items:
+        cleaned_word = clean_special_chars_from_token(item.get("text", ""))
+        if not cleaned_word:
+            continue
+        filtered.append({"rect": item["rect"], "text": cleaned_word})
+    return filtered
 
 
 def smart_join_ocr_tokens(tokens: list) -> str:
@@ -181,6 +250,7 @@ def is_already_target_language(text: str, target_lang: str) -> bool:
         if vn_count >= 1:
             return True
     return False
+
 
 
 def get_installed_tesseract_langs() -> list:
@@ -1127,12 +1197,19 @@ class TranslationWorker(QThread):
 
         line_entries = []
         skipped_native = 0
-        for line_items in lines:
+        for raw_line_items in lines:
+            line_items = filter_ocr_line_items(raw_line_items)
+            if not line_items:
+                continue
+
             tokens = [item['text'] for item in line_items]
             if "+" in self.tess_lang or self.tess_lang in ["chi_sim", "jpn"]:
                 line_str = smart_join_ocr_tokens(tokens)
             else:
                 line_str = " ".join(tokens)
+
+            if is_symbol_or_number_only(line_str):
+                continue
 
             if is_already_target_language(line_str, self.target_lang):
                 skipped_native += 1
