@@ -1112,6 +1112,25 @@ class TranslationKnowledgeManager:
             return "\n".join(lines)
 
 
+def is_same_ocr_data(new_raw: str, old_raw: str) -> bool:
+    """
+    Determine whether newly scanned OCR text is identical (or >= 92% fuzzy match for minor OCR jitter)
+    to the previously translated OCR text so Auto-Translate never re-translates old data.
+    """
+    if not new_raw and not old_raw:
+        return True
+    if not new_raw or not old_raw:
+        return False
+    n1 = " ".join(new_raw.strip().lower().split())
+    n2 = " ".join(old_raw.strip().lower().split())
+    if n1 == n2:
+        return True
+    if len(n1) >= 6 and abs(len(n1) - len(n2)) <= 4:
+        if TranslationKnowledgeManager._text_similarity(n1, n2) >= 0.92:
+            return True
+    return False
+
+
 # =====================================================================
 # 1. BACKGROUND WORKER: OCR & BATCH CONTEXTUAL TRANSLATION (QTHREAD)
 # =====================================================================
@@ -1130,7 +1149,8 @@ class TranslationWorker(QThread):
         model_name,
         last_raw_text,
         knowledge_mgr: TranslationKnowledgeManager = None,
-        src_selection_text: str = ""
+        src_selection_text: str = "",
+        prev_blocks: list = None
     ):
         super().__init__()
         self.pil_img = pil_img
@@ -1142,6 +1162,7 @@ class TranslationWorker(QThread):
         self.last_raw_text = last_raw_text
         self.knowledge_mgr = knowledge_mgr
         self.src_selection_text = src_selection_text
+        self.prev_blocks = list(prev_blocks) if prev_blocks else []
 
     def run(self):
         try:
@@ -1242,8 +1263,8 @@ class TranslationWorker(QThread):
             return
 
         combined_raw = "\n".join([entry['raw_text'] for entry in line_entries])
-        if combined_raw == self.last_raw_text:
-            self.finished_signal.emit(None, "Idle (Source text unchanged)")
+        if is_same_ocr_data(combined_raw, self.last_raw_text):
+            self.finished_signal.emit(None, "✓ Dữ liệu cũ không đổi (Không cần dịch lại)")
             return
 
         raw_list = [entry['raw_text'] for entry in line_entries]
@@ -1267,7 +1288,7 @@ class TranslationWorker(QThread):
         skip_note = f" • Giữ nguyên {skipped_native} dòng nội ngữ" if skipped_native else ""
         self.finished_signal.emit(
             overlay_blocks,
-            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Cache: {cache_hits}/{len(raw_list)} • AI mới: {ai_calls}{skip_note})"
+            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Dữ liệu cũ/Cache: {cache_hits}/{len(raw_list)} • Dịch mới: {ai_calls}{skip_note})"
         )
 
     @staticmethod
@@ -1342,17 +1363,30 @@ class TranslationWorker(QThread):
             return (15, 23, 42), (248, 250, 252)
 
     def resolve_with_cache_and_translate(self, text_lines: list):
-        """Check local Cache/Codex first; only send uncached lines to AI/Google, then persist new translations."""
-        if not self.knowledge_mgr:
-            return self.translate_batch_with_context(text_lines), 0
-
+        """
+        Check previous on-screen blocks and local Cache/Codex first;
+        ONLY translate genuinely NEW lines that haven't been translated yet.
+        """
         final_translations = [None] * len(text_lines)
         missing_indices = []
         missing_lines = []
         cache_hits = 0
 
         for idx, line in enumerate(text_lines):
-            cached = self.knowledge_mgr.lookup_cached_translation(line, self.target_lang)
+            # 1. Reuse existing on-screen block translation if this line is already on screen (old data)
+            reused_prev = None
+            for pb in self.prev_blocks:
+                pb_raw = pb.get("raw_line", "")
+                if pb_raw and is_same_ocr_data(line, pb_raw):
+                    reused_prev = pb.get("text")
+                    break
+            if reused_prev is not None:
+                final_translations[idx] = reused_prev
+                cache_hits += 1
+                continue
+
+            # 2. Check persistent Cache / Codex / 133K Dictionary
+            cached = self.knowledge_mgr.lookup_cached_translation(line, self.target_lang) if self.knowledge_mgr else None
             if cached is not None:
                 final_translations[idx] = cached
                 cache_hits += 1
@@ -1366,13 +1400,15 @@ class TranslationWorker(QThread):
                 trans = newly_translated[i] if i < len(newly_translated) else missing_lines[i]
                 final_translations[orig_idx] = trans
 
-            self.knowledge_mgr.store_cached_translations(
-                missing_lines,
-                [final_translations[i] for i in missing_indices],
-                self.target_lang
-            )
+            if self.knowledge_mgr:
+                self.knowledge_mgr.store_cached_translations(
+                    missing_lines,
+                    [final_translations[i] for i in missing_indices],
+                    self.target_lang
+                )
 
-        self.knowledge_mgr.record_dialogue(text_lines, final_translations)
+        if self.knowledge_mgr:
+            self.knowledge_mgr.record_dialogue(text_lines, final_translations)
         return final_translations, cache_hits
 
     def _build_codex_context_block(self, text_lines: list) -> str:
@@ -2517,6 +2553,7 @@ class MainStudioWindow(QWidget):
         self.worker = None
         self.update_worker = None
         self.last_raw_text = ""
+        self.last_valid_blocks = []
         self.last_frame_sig = None
         self.active_scene_sig = None
         self.last_captured_pil_img = None
@@ -2529,7 +2566,7 @@ class MainStudioWindow(QWidget):
         self.hotkey_bridge.trigger_tab_switched.connect(self.on_scene_or_tab_changed)
 
         self.auto_timer = QTimer(self)
-        self.auto_timer.timeout.connect(self.initiate_capture_and_translate)
+        self.auto_timer.timeout.connect(self._on_auto_timer_tick)
 
         self.scene_watch_timer = QTimer(self)
         self.scene_watch_timer.setInterval(260)
@@ -3415,6 +3452,7 @@ class MainStudioWindow(QWidget):
 
     def clear_overlay_text(self):
         self.overlay_hud.blocks = []
+        self.last_valid_blocks = []
         self.last_raw_text = ""
         self.last_frame_sig = None
         self.active_scene_sig = None
@@ -3430,6 +3468,7 @@ class MainStudioWindow(QWidget):
         if not self.chk_auto_clear.isChecked() or not self.overlay_hud.blocks:
             return
         self.overlay_hud.blocks = []
+        self.last_valid_blocks = []
         self.last_raw_text = ""
         self.last_frame_sig = None
         self.active_scene_sig = None
@@ -3441,7 +3480,9 @@ class MainStudioWindow(QWidget):
     def toggle_auto_timer(self, state):
         if state == Qt.Checked:
             self.auto_timer.start(self.sp_interval.value() * 1000)
-            self.lbl_status.setText(f"Auto-scan active (every {self.sp_interval.value()}s)...")
+            self.lbl_status.setText(f"Auto-scan active (chỉ dịch khi có dữ liệu mới • {self.sp_interval.value()}s)...")
+            if self.last_frame_sig is None:
+                QTimer.singleShot(50, self._on_auto_timer_tick)
         else:
             self.auto_timer.stop()
             self.lbl_status.setText("Auto-scan disabled.")
@@ -3514,6 +3555,26 @@ class MainStudioWindow(QWidget):
 
         return tuple(samples)
 
+    def _grab_raw_hud_image(self):
+        """Grab the current HUD region directly via mss without hiding the overlay."""
+        geo = self.overlay_hud.geometry()
+        screen = QApplication.screenAt(geo.center()) or QApplication.primaryScreen()
+        dpr = screen.devicePixelRatio()
+        self.overlay_hud.dpr = dpr
+
+        phys_x = int(geo.x() * dpr)
+        phys_y = int(geo.y() * dpr)
+        phys_w = int(geo.width() * dpr)
+        phys_h = int(geo.height() * dpr)
+
+        try:
+            with mss.mss() as sct:
+                monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
+                sct_img = sct.grab(monitor)
+                return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        except Exception:
+            return None
+
     def _grab_live_unmasked_signature(self) -> tuple:
         """
         Grab the current HUD region (and top tab-bar strip if not obscured) without hiding the HUD,
@@ -3559,30 +3620,68 @@ class MainStudioWindow(QWidget):
             if sig:
                 self.active_scene_sig = sig
 
-    def _check_scene_or_tab_change(self):
+    def _on_auto_timer_tick(self):
         """
-        Periodic 260ms non-intrusive check: if the user switched browser/game tabs, scrolled,
-        or changed windows while translation pills are on screen, clear the stale overlay immediately.
+        Smart Auto-Translate tick: only trigger screen capture & OCR when NEW screen data is detected.
+        If the screen still displays old data, keep the existing overlay untouched without blinking or re-scanning.
         """
         if (
-            not self.chk_auto_clear.isChecked()
-            or not self.overlay_hud.blocks
+            (self.worker and self.worker.isRunning())
             or self.overlay_hud.is_capturing
+            or self.overlay_hud.is_hidden_by_user
+        ):
+            return
+
+        # Case 1: Overlay currently has translated blocks on screen -> check unmasked live signature (0ms, no blink)
+        if self.overlay_hud.blocks and self.active_scene_sig:
+            live_sig = self._grab_live_unmasked_signature()
+            if live_sig and len(live_sig) == len(self.active_scene_sig):
+                if self.frame_signature_diff(live_sig, self.active_scene_sig) < 3.8:
+                    self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ chưa đổi (Giữ nguyên bản dịch, không quét lại)")
+                    return
+
+        # Case 2: Overlay has no blocks (empty scene already scanned) -> check raw frame signature without blinking
+        elif not self.overlay_hud.blocks and self.last_frame_sig is not None:
+            raw_img = self._grab_raw_hud_image()
+            if raw_img is not None:
+                new_sig = self.compute_frame_signature(raw_img)
+                if self.frame_signature_diff(new_sig, self.last_frame_sig) < 2.5:
+                    self.lbl_status.setText("✓ Auto Dịch: Màn hình chưa có dữ liệu mới (Đang chờ...)")
+                    return
+
+        self.initiate_capture_and_translate()
+
+    def _check_scene_or_tab_change(self):
+        """
+        Periodic 260ms non-intrusive check:
+        1. If translation pills are on screen and the user switches tabs/scrolls, clear stale overlay immediately.
+        2. If Auto-Scan is enabled on an empty screen and new text/UI appears, trigger translation immediately.
+        """
+        if (
+            self.overlay_hud.is_capturing
             or self.overlay_hud.is_hidden_by_user
             or (self.worker and self.worker.isRunning())
         ):
             return
 
-        live_sig = self._grab_live_unmasked_signature()
-        if not live_sig:
-            return
-
-        if not self.active_scene_sig or len(live_sig) != len(self.active_scene_sig):
-            self.active_scene_sig = live_sig
-            return
-
-        if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 4.0:
-            self.on_scene_or_tab_changed()
+        if self.overlay_hud.blocks:
+            if not self.chk_auto_clear.isChecked():
+                return
+            live_sig = self._grab_live_unmasked_signature()
+            if not live_sig:
+                return
+            if not self.active_scene_sig or len(live_sig) != len(self.active_scene_sig):
+                self.active_scene_sig = live_sig
+                return
+            if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 4.0:
+                self.on_scene_or_tab_changed()
+        elif self.chk_auto.isChecked() and self.last_frame_sig is not None:
+            raw_img = self._grab_raw_hud_image()
+            if raw_img is not None:
+                new_sig = self.compute_frame_signature(raw_img)
+                if self.frame_signature_diff(new_sig, self.last_frame_sig) >= 3.5:
+                    self.last_frame_sig = None
+                    QTimer.singleShot(180, self.initiate_capture_and_translate)
 
     def initiate_capture_and_translate(self):
         if self.worker and self.worker.isRunning():
@@ -3623,6 +3722,9 @@ class MainStudioWindow(QWidget):
             return
 
         self.last_captured_pil_img = pil_img
+        if self.overlay_hud.blocks:
+            self.last_valid_blocks = list(self.overlay_hud.blocks)
+
         new_sig = self.compute_frame_signature(pil_img)
         frame_diff = (
             self.frame_signature_diff(new_sig, self.last_frame_sig)
@@ -3630,11 +3732,10 @@ class MainStudioWindow(QWidget):
             else 999.0
         )
 
-        # Critical Fix: If the screen/tab changed, clear old overlay blocks BEFORE un-hiding HUD
-        # so the previous tab's blocks NEVER flash or linger on top of the new tab while OCR runs!
-        if frame_diff >= 1.5 and self.overlay_hud.blocks:
+        # If a major scene/tab change occurred (frame_diff >= 4.0), hide stale blocks while OCR runs,
+        # but PRESERVE self.last_raw_text so if the OCR text is still the same old text, it won't re-translate!
+        if frame_diff >= 4.0 and self.overlay_hud.blocks:
             self.overlay_hud.blocks = []
-            self.last_raw_text = ""
             self.active_scene_sig = None
 
         # Phase 2: Restore overlay and Studio window state
@@ -3643,14 +3744,13 @@ class MainStudioWindow(QWidget):
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
-        # Fast Pixel-Delta Skip during Auto-Scan: if screen pixels haven't changed, skip Tesseract OCR to save CPU/FPS
+        # Fast Pixel-Delta Skip: if screen pixels haven't changed (whether blocks are present or empty), skip OCR!
         if (
             self.chk_auto.isChecked()
-            and self.overlay_hud.blocks
             and self.last_frame_sig is not None
-            and frame_diff < 1.5
+            and frame_diff < 2.2
         ):
-            self.lbl_status.setText("⚡ Khung hình game không đổi (Bỏ qua OCR để giữ mượt FPS)")
+            self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ không đổi (Bỏ qua OCR & giữ nguyên bản dịch)")
             return
         self.last_frame_sig = new_sig
 
@@ -3658,7 +3758,7 @@ class MainStudioWindow(QWidget):
         tess_lang = resolve_ocr_lang_string(src_selection)
         target_lang = self.cb_dst.currentText()
 
-        self.lbl_status.setText("⏳ Đang OCR & tra cứu Bách Khoa / Cache...")
+        self.lbl_status.setText("⏳ Đang OCR & kiểm tra dữ liệu mới...")
         self.worker = TranslationWorker(
             pil_img=pil_img,
             tess_lang=tess_lang,
@@ -3668,7 +3768,8 @@ class MainStudioWindow(QWidget):
             model_name=self.txt_model.text(),
             last_raw_text=self.last_raw_text,
             knowledge_mgr=self.knowledge_mgr,
-            src_selection_text=src_selection
+            src_selection_text=src_selection,
+            prev_blocks=self.last_valid_blocks
         )
         self.worker.finished_signal.connect(self._on_translation_done)
         self.worker.error_signal.connect(self._on_translation_error)
@@ -3676,11 +3777,19 @@ class MainStudioWindow(QWidget):
         self.worker.start()
 
     def _on_translation_done(self, blocks, status_msg):
-        if blocks is not None:
+        if blocks is None:
+            # Source text on screen is unchanged old data -> restore previous blocks if they were temporarily hidden
+            if not self.overlay_hud.blocks and self.last_valid_blocks:
+                self.overlay_hud.blocks = list(self.last_valid_blocks)
+                self.overlay_hud.repaint()
+                QTimer.singleShot(60, self._refresh_active_scene_signature)
+        else:
             self.overlay_hud.blocks = blocks
             if blocks:
+                self.last_valid_blocks = list(blocks)
                 self.last_raw_text = blocks[0]['raw']
             else:
+                self.last_valid_blocks = []
                 self.last_raw_text = ""
                 self.active_scene_sig = None
             self.overlay_hud.repaint()

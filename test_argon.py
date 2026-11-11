@@ -680,6 +680,62 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             self.assertIsNone(studio.active_scene_sig)
             studio.close()
 
+    def test_smart_auto_translate_only_translates_new_data(self):
+        """Verify Auto-Translate skips old data without blinking/re-scanning and only translates genuinely new lines."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = os.path.join(tmpdir, "smart_auto_config.json")
+            studio = aot.MainStudioWindow(config_path=cfg_path)
+
+            # 1. Verify is_same_ocr_data handles exact and minor OCR jitter (>=92% similarity)
+            self.assertTrue(aot.is_same_ocr_data("Welcome to the Dragon Temple!", "welcome to the dragon temple!"))
+            self.assertTrue(aot.is_same_ocr_data("Welcome to the Dragon Temple!", "Welcome to the Dragon Temple."))
+            self.assertFalse(aot.is_same_ocr_data("Welcome to the Dragon Temple!", "Defeat the Shadow Boss now!"))
+
+            # 2. Verify _on_auto_timer_tick skips capture when active_scene_sig is unchanged (old data)
+            prev_block = {
+                "text": "Chào mừng đến Đền Rồng",
+                "rect": (20, 20, 150, 24),
+                "raw": "Welcome to the Dragon Temple",
+                "raw_line": "Welcome to the Dragon Temple"
+            }
+            studio.overlay_hud.blocks = [prev_block]
+            studio.last_valid_blocks = [prev_block]
+            studio.active_scene_sig = (10, 20, 30, 40, 50, 60)
+
+            with unittest.mock.patch.object(studio, "_grab_live_unmasked_signature", return_value=(10, 20, 30, 40, 50, 60)), \
+                 unittest.mock.patch.object(studio, "initiate_capture_and_translate") as mock_cap:
+                studio._on_auto_timer_tick()
+                mock_cap.assert_not_called()
+
+            # 3. Verify _on_auto_timer_tick triggers capture ONLY when scene signature changes (new data)
+            with unittest.mock.patch.object(studio, "_grab_live_unmasked_signature", return_value=(200, 210, 220, 230, 240, 250)), \
+                 unittest.mock.patch.object(studio, "initiate_capture_and_translate") as mock_cap:
+                studio._on_auto_timer_tick()
+                mock_cap.assert_called_once()
+
+            # 4. Verify TranslationWorker reuses prev_blocks for old lines and only translates new lines
+            worker = aot.TranslationWorker(
+                pil_img=None,
+                tess_lang="eng",
+                target_lang="Vietnamese",
+                api_url="",
+                api_key="",
+                model_name="",
+                last_raw_text="Welcome to the Dragon Temple",
+                knowledge_mgr=None,
+                prev_blocks=[prev_block]
+            )
+            with unittest.mock.patch.object(worker, "translate_batch_with_context", return_value=["Hãy tiêu diệt Trùm Bóng Tối"]) as mock_batch:
+                out_lines, hits = worker.resolve_with_cache_and_translate([
+                    "Welcome to the Dragon Temple",
+                    "Defeat the Shadow Boss"
+                ])
+                mock_batch.assert_called_once_with(["Defeat the Shadow Boss"])
+                self.assertEqual(hits, 1)
+                self.assertEqual(out_lines, ["Chào mừng đến Đền Rồng", "Hãy tiêu diệt Trùm Bóng Tối"])
+
+            studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
