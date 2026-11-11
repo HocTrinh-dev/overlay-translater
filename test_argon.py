@@ -314,6 +314,40 @@ class TestArgonOverlayTranslator(unittest.TestCase):
                     f"Module '{top_mod}' is not bundled in ArgonTranslator.exe launcher.py!"
                 )
 
+    def test_multilang_chat_smart_join_and_vietnamese_skip(self):
+        """Verify Multi-Language Chat OCR lang resolution, CJK+Latin token joiner, and skipping Vietnamese chat lines."""
+        # 1. Dynamic OCR language string resolution
+        resolved = aot.resolve_ocr_lang_string(
+            "🌐 Multi-Language Chat (multi)",
+            installed_langs=["eng", "chi_sim", "jpn", "kor", "osd"]
+        )
+        self.assertEqual(resolved, "eng+chi_sim+jpn+kor")
+
+        # Fallback if only eng + chi_sim are installed
+        partial = aot.resolve_ocr_lang_string(
+            "🌐 Multi-Language Chat (multi)",
+            installed_langs=["eng", "chi_sim"]
+        )
+        self.assertEqual(partial, "eng+chi_sim")
+
+        # 2. Smart Mixed-Script Token Joining (no space between CJK, keep space for English/Korean)
+        mixed_tokens = ["[World]", "龙傲", "天:", "Hello", "兄弟", "们", "party", "up!"]
+        self.assertEqual(
+            aot.smart_join_ocr_tokens(mixed_tokens),
+            "[World] 龙傲天: Hello 兄弟们 party up!"
+        )
+
+        # 3. Skip lines already written in Vietnamese inside a mixed chat box
+        self.assertTrue(
+            aot.is_already_target_language("[Thế Giới] NamPro: Anh em đi phụ bản không?", "Vietnamese")
+        )
+        self.assertFalse(
+            aot.is_already_target_language("[World] Dragon: Anyone going dungeon?", "Vietnamese")
+        )
+        self.assertFalse(
+            aot.is_already_target_language("[World] 龙傲天: 组队刷副本", "Vietnamese")
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

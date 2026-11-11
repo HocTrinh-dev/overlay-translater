@@ -73,6 +73,110 @@ def normalize_github_raw_url(url: str) -> str:
 
 
 # =====================================================================
+# MULTI-LANGUAGE CHAT BOX OCR & MIXED-SCRIPT HELPERS
+# =====================================================================
+_VIETNAMESE_UNIQUE_CHARS = set(
+    "ăâđêôơưĂÂĐÊÔƠƯ"
+    "ảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ"
+    "ẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ"
+)
+
+
+def _is_cjk_ideograph_or_kana(ch: str) -> bool:
+    """Return True for Chinese Hanzi, Japanese Kana/Kanji, and CJK fullwidth symbols (excludes Hangul which uses spaces)."""
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        (0x3000 <= code <= 0x9FFF)
+        or (0xF900 <= code <= 0xFAFF)
+        or (0xFF00 <= code <= 0xFFEF)
+    )
+
+
+def _contains_cjk_or_hangul(text: str) -> bool:
+    for ch in text:
+        code = ord(ch)
+        if (0x3000 <= code <= 0x9FFF) or (0xAC00 <= code <= 0xD7A3) or (0xF900 <= code <= 0xFAFF):
+            return True
+    return False
+
+
+def smart_join_ocr_tokens(tokens: list) -> str:
+    """
+    Join OCR word tokens on a single line intelligently for mixed-language chat boxes:
+    - Adjacent Chinese/Japanese tokens are joined without spaces.
+    - Latin (English/Vietnamese), Korean (Hangul), and numbers are joined with a space.
+    """
+    cleaned = [t.strip() for t in tokens if t and t.strip()]
+    if not cleaned:
+        return ""
+    result = [cleaned[0]]
+    for token in cleaned[1:]:
+        prev_char = result[-1][-1]
+        next_char = token[0]
+        if _is_cjk_ideograph_or_kana(prev_char) and _is_cjk_ideograph_or_kana(next_char):
+            result.append(token)
+        else:
+            result.append(" " + token)
+    return "".join(result)
+
+
+def is_already_target_language(text: str, target_lang: str) -> bool:
+    """
+    Detect if a chat line is already written in the user's target language (e.g. Vietnamese chat line
+    inside a multi-language world chat box) so we can skip covering it with an overlay pill.
+    """
+    if not text or not text.strip():
+        return True
+    if target_lang.lower().startswith("viet"):
+        if _contains_cjk_or_hangul(text):
+            return False
+        vn_count = sum(1 for ch in text if ch in _VIETNAMESE_UNIQUE_CHARS)
+        if vn_count >= 1:
+            return True
+    return False
+
+
+def get_installed_tesseract_langs() -> list:
+    """Return list of installed Tesseract language codes without spawning slow subprocesses if tessdata dir exists."""
+    tess_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", DEFAULT_TESSERACT)
+    tess_dir = os.path.join(os.path.dirname(tess_cmd), "tessdata")
+    if os.path.isdir(tess_dir):
+        try:
+            langs = [
+                 fn[:-12] for fn in os.listdir(tess_dir)
+                if fn.lower().endswith(".traineddata") and fn[:-12] != "osd"
+            ]
+            if langs:
+                return langs
+        except Exception:
+            pass
+    try:
+        return pytesseract.get_languages(config="")
+    except Exception:
+        return ["eng"]
+
+
+def resolve_ocr_lang_string(selection_text: str, installed_langs: list = None) -> str:
+    """
+    Resolve UI combo selection into Tesseract `lang` parameter.
+    For Multi-Language Chat mode, dynamically combines available packs (e.g. 'eng+chi_sim+jpn+kor').
+    """
+    text_lower = (selection_text or "").lower()
+    if "multi" in text_lower or "đa ngôn ngữ" in text_lower or "+" in text_lower:
+        available = set(installed_langs if installed_langs is not None else get_installed_tesseract_langs())
+        preferred_order = ["eng", "chi_sim", "jpn", "kor"]
+        active = [code for code in preferred_order if code in available]
+        return "+".join(active) if active else "eng"
+
+    for code in ("chi_sim", "jpn", "kor", "eng"):
+        if f"({code})" in text_lower or text_lower == code:
+            return code
+    return "eng"
+
+
+# =====================================================================
 # 0. GAME CODEX (ENCYCLOPEDIA) & PERSISTENT TRANSLATION CACHE ENGINE
 # =====================================================================
 GAME_STYLE_PRESETS = [
@@ -472,9 +576,18 @@ class TranslationWorker(QThread):
             return
 
         line_entries = []
+        skipped_native = 0
         for line_items in lines:
-            sep = "" if self.tess_lang in ["chi_sim", "jpn"] else " "
-            line_str = sep.join([item['text'] for item in line_items])
+            tokens = [item['text'] for item in line_items]
+            if "+" in self.tess_lang or self.tess_lang in ["chi_sim", "jpn"]:
+                line_str = smart_join_ocr_tokens(tokens)
+            else:
+                line_str = " ".join(tokens)
+
+            if is_already_target_language(line_str, self.target_lang):
+                skipped_native += 1
+                continue
+
             min_x = min(item['rect'][0] for item in line_items)
             min_y = min(item['rect'][1] for item in line_items)
             max_x = max(item['rect'][0] + item['rect'][2] for item in line_items)
@@ -483,6 +596,13 @@ class TranslationWorker(QThread):
                 'rect': (min_x, min_y, max_x - min_x, max_y - min_y),
                 'raw_text': line_str
             })
+
+        if not line_entries:
+            if skipped_native > 0:
+                self.finished_signal.emit([], f"✓ Giữ nguyên {skipped_native} dòng chat đã là {self.target_lang}.")
+            else:
+                self.finished_signal.emit([], "No text detected in capture region.")
+            return
 
         combined_raw = "\n".join([entry['raw_text'] for entry in line_entries])
         if combined_raw == self.last_raw_text:
@@ -504,9 +624,10 @@ class TranslationWorker(QThread):
 
         timestamp = time.strftime('%H:%M:%S')
         ai_calls = len(raw_list) - cache_hits
+        skip_note = f" • Giữ nguyên {skipped_native} dòng nội ngữ" if skipped_native else ""
         self.finished_signal.emit(
             overlay_blocks,
-            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Cache: {cache_hits}/{len(raw_list)} • AI mới: {ai_calls})"
+            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Cache: {cache_hits}/{len(raw_list)} • AI mới: {ai_calls}{skip_note})"
         )
 
     def resolve_with_cache_and_translate(self, text_lines: list):
@@ -574,9 +695,12 @@ class TranslationWorker(QThread):
                 codex_block = self._build_codex_context_block(text_lines)
                 extra_instructions = f"\n\n{codex_block}\n" if codex_block else ""
                 system_prompt = (
-                    f"You are an expert game & application context-aware translator. "
-                    f"Receive a JSON array of text lines captured from a screen. "
-                    f"Understand the full context across all lines, then translate each line naturally into {self.target_lang}."
+                    f"You are an expert game & multi-language chat translator. "
+                    f"Receive a JSON array of text lines captured from a screen or in-game chat box. "
+                    f"Different lines (or even parts within a single line) may be in different languages "
+                    f"(English, Chinese, Japanese, Korean, Russian, etc.). "
+                    f"Auto-detect the language(s) of each line, preserve player usernames/prefixes like '[Channel] PlayerName:', "
+                    f"understand gaming slang/abbreviations, and translate each line naturally into {self.target_lang}."
                     f"{extra_instructions}"
                     f"Return ONLY a valid JSON array of strings with the exact same number of elements ({len(text_lines)})."
                 )
@@ -1552,8 +1676,12 @@ class MainStudioWindow(QWidget):
             "English (eng)",
             "Simplified Chinese (chi_sim)",
             "Japanese (jpn)",
-            "Korean (kor)"
+            "Korean (kor)",
+            "🌐 Multi-Language Chat (multi)"
         ])
+        self.cb_src.setToolTip(
+            "Chọn '🌐 Multi-Language Chat (multi)' khi quét khung Chat Thế Giới có nhiều ngôn ngữ trộn lẫn (Anh/Trung/Nhật/Hàn/Việt)"
+        )
         col_src.addWidget(lbl_s)
         col_src.addWidget(self.cb_src)
 
@@ -1981,8 +2109,7 @@ class MainStudioWindow(QWidget):
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
-        lang_map = ["eng", "chi_sim", "jpn", "kor"]
-        tess_lang = lang_map[self.cb_src.currentIndex()]
+        tess_lang = resolve_ocr_lang_string(self.cb_src.currentText())
         target_lang = self.cb_dst.currentText()
 
         self.lbl_status.setText("⏳ Đang OCR & tra cứu Bách Khoa / Cache...")
