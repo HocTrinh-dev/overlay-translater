@@ -145,11 +145,43 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         studio.show()
         self.assertGreaterEqual(studio.cb_src.height(), 36)
         self.assertGreaterEqual(studio.cb_dst.height(), 36)
+        self.assertGreaterEqual(studio.cb_mode.height(), 36)
         self.assertGreaterEqual(studio.txt_url.height(), 36)
         self.assertGreaterEqual(studio.txt_model.height(), 36)
         self.assertGreaterEqual(studio.txt_key.height(), 36)
         self.assertIsInstance(studio.cb_src.view(), aot.QListView)
         self.assertIsInstance(studio.cb_dst.view(), aot.QListView)
+        self.assertIsInstance(studio.cb_mode.view(), aot.QListView)
+        studio.close()
+
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    @patch("argon_overlay_translator.QTimer.singleShot")
+    def test_fullscreen_and_snip_region_modes(self, mock_single_shot, mock_hotkey):
+        """Verify switching between Full Screen and Region Box modes, and Snipping Region selection."""
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        custom_rect = aot.QRect(180, 210, 480, 200)
+        studio.overlay_hud.setGeometry(custom_rect)
+
+        # Switch to Full Screen mode (index 1)
+        studio.cb_mode.setCurrentIndex(1)
+        self.assertTrue(studio.overlay_hud.is_fullscreen)
+        self.assertTrue(studio.overlay_hud.is_locked)
+        screen_geo = QApplication.primaryScreen().geometry()
+        self.assertEqual(studio.overlay_hud.geometry().width(), screen_geo.width())
+        self.assertEqual(studio.overlay_hud.geometry().height(), screen_geo.height())
+
+        # Switch back to Region Box mode (index 0) and verify custom_rect is restored
+        studio.cb_mode.setCurrentIndex(0)
+        self.assertFalse(studio.overlay_hud.is_fullscreen)
+        self.assertEqual(studio.overlay_hud.geometry(), custom_rect)
+
+        # Simulate snipping a new region via RegionSnipperOverlay
+        snipped_rect = aot.QRect(250, 300, 500, 160)
+        studio.cb_mode.setCurrentIndex(1)  # Even from Full Screen mode
+        studio._on_region_snipped(snipped_rect)
+        self.assertEqual(studio.cb_mode.currentIndex(), 0)
+        self.assertFalse(studio.overlay_hud.is_fullscreen)
+        self.assertEqual(studio.overlay_hud.geometry(), snipped_rect)
         studio.close()
 
 

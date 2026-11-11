@@ -305,6 +305,7 @@ class FloatingOverlayHUD(QWidget):
         super().__init__()
         self.blocks = []
         self.is_locked = False
+        self.is_fullscreen = False
         self.is_capturing = False
         self.resizing = False
         self.drag_offset = None
@@ -343,13 +344,13 @@ class FloatingOverlayHUD(QWidget):
 
         w, h = self.width(), self.height()
 
-        if not self.is_locked:
+        if not self.is_locked and not self.is_fullscreen:
             pen = QPen(QColor(99, 102, 241, 210), 1.5, Qt.SolidLine)
             painter.setPen(pen)
             painter.setBrush(QBrush(QColor(15, 23, 42, 25)))
             painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
 
-            badge_rect = QRectF(8, 8, 235, 24)
+            badge_rect = QRectF(8, 8, 285, 24)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
             painter.drawRoundedRect(badge_rect, 6, 6)
@@ -359,7 +360,7 @@ class FloatingOverlayHUD(QWidget):
             painter.drawText(
                 badge_rect.adjusted(10, 0, -6, 0),
                 Qt.AlignVCenter | Qt.AlignLeft,
-                "⚡ Drag to move  •  F9: Translate  •  F10: Lock"
+                "⚡ Drag to move • F8: Snip • F9: Translate • F10: Lock"
             )
 
             grip_path = QPainterPath()
@@ -401,7 +402,7 @@ class FloatingOverlayHUD(QWidget):
             )
 
     def mousePressEvent(self, event):
-        if self.is_locked:
+        if self.is_locked or self.is_fullscreen:
             return
         if event.button() == Qt.LeftButton:
             if event.x() >= self.width() - 20 and event.y() >= self.height() - 20:
@@ -411,7 +412,7 @@ class FloatingOverlayHUD(QWidget):
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self.is_locked:
+        if self.is_locked or self.is_fullscreen:
             return
         if event.x() >= self.width() - 20 and event.y() >= self.height() - 20:
             self.setCursor(Qt.SizeFDiagCursor)
@@ -432,11 +433,101 @@ class FloatingOverlayHUD(QWidget):
 
 
 # =====================================================================
+# 2B. INTERACTIVE REGION SNIPPER OVERLAY (F8 - DRAG TO SELECT FRAME)
+# =====================================================================
+class RegionSnipperOverlay(QWidget):
+    region_selected = pyqtSignal(QRect)
+
+    def __init__(self):
+        super().__init__()
+        self.start_pos = None
+        self.end_pos = None
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setCursor(Qt.CrossCursor)
+
+    def start_selection(self, screen_geo: QRect):
+        self.start_pos = None
+        self.end_pos = None
+        self.setGeometry(screen_geo)
+        self.show()
+        self.activateWindow()
+        self.raise_()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Dim entire screen slightly
+        painter.fillRect(self.rect(), QColor(11, 15, 25, 120))
+
+        # Top instruction pill
+        hint_rect = QRectF((self.width() - 420) / 2, 24, 420, 34)
+        painter.setPen(QPen(QColor(99, 102, 241, 180), 1))
+        painter.setBrush(QBrush(QColor(15, 23, 42, 235)))
+        painter.drawRoundedRect(hint_rect, 8, 8)
+        painter.setPen(QColor(248, 250, 252))
+        painter.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
+        painter.drawText(
+            hint_rect,
+            Qt.AlignCenter,
+            "✂️ Kéo chuột để chọn khung dịch  •  Nhấn ESC hoặc Chuột phải để hủy"
+        )
+
+        if self.start_pos and self.end_pos:
+            sel_rect = QRect(self.start_pos, self.end_pos).normalized()
+            # Clear inner region so user sees crisp underlying text
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(sel_rect, Qt.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+            pen = QPen(QColor(99, 102, 241, 245), 2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(99, 102, 241, 20)))
+            painter.drawRoundedRect(QRectF(sel_rect), 6, 6)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.close()
+            return
+        if event.button() == Qt.LeftButton:
+            self.start_pos = event.pos()
+            self.end_pos = event.pos()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.start_pos:
+            self.end_pos = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.start_pos and self.end_pos:
+            sel_rect = QRect(self.start_pos, self.end_pos).normalized()
+            global_top_left = self.mapToGlobal(sel_rect.topLeft())
+            final_rect = QRect(
+                global_top_left.x(),
+                global_top_left.y(),
+                max(140, sel_rect.width()),
+                max(60, sel_rect.height())
+            )
+            self.close()
+            if sel_rect.width() >= 25 and sel_rect.height() >= 15:
+                self.region_selected.emit(final_rect)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+# =====================================================================
 # 3. MAIN CONTROL STUDIO WINDOW (HIGH-CRAFT DARK UI)
 # =====================================================================
 class HotkeyBridge(QObject):
     trigger_translate = pyqtSignal()
     trigger_lock = pyqtSignal()
+    trigger_snip = pyqtSignal()
 
 
 DEFAULT_REPO_URL = "https://github.com/HocTrinh-dev/overlay-translater.git"
@@ -450,11 +541,15 @@ class MainStudioWindow(QWidget):
         self.config_path = config_path
         self.update_url = DEFAULT_UPDATE_URL
         self.auto_update_on_start = True
+        self.saved_region_rect = QRect(350, 280, 560, 220)
 
         self.setWindowTitle("Argon Context Overlay Translator")
         self.setMinimumWidth(520)
 
         self.overlay_hud = FloatingOverlayHUD()
+        self.snipper = RegionSnipperOverlay()
+        self.snipper.region_selected.connect(self._on_region_snipped)
+
         self.worker = None
         self.update_worker = None
         self.last_raw_text = ""
@@ -462,6 +557,7 @@ class MainStudioWindow(QWidget):
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.trigger_translate.connect(self.initiate_capture_and_translate)
         self.hotkey_bridge.trigger_lock.connect(self.toggle_lock_mode)
+        self.hotkey_bridge.trigger_snip.connect(self.start_snip_region)
 
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self.initiate_capture_and_translate)
@@ -671,6 +767,35 @@ class MainStudioWindow(QWidget):
         row_lang.addLayout(col_dst, 1)
         c1_layout.addLayout(row_lang)
 
+        # Capture Mode Row: Region Box vs Full Screen + Quick Snip Frame button
+        col_mode = QVBoxLayout()
+        col_mode.setSpacing(6)
+        lbl_mode = QLabel("Capture Mode (Chế độ vùng dịch):")
+        lbl_mode.setObjectName("FieldLabel")
+        row_mode = QHBoxLayout()
+        row_mode.setSpacing(10)
+
+        self.cb_mode = QComboBox()
+        self.cb_mode.setView(QListView())
+        self.cb_mode.setFixedHeight(36)
+        self.cb_mode.addItems([
+            "🔲 Region Box (Khung HUD tùy chỉnh)",
+            "🖥️ Full Screen (Toàn màn hình)"
+        ])
+        self.cb_mode.currentIndexChanged.connect(self.on_capture_mode_changed)
+
+        self.btn_snip = QPushButton("✂️ Kéo chọn khung (F8)")
+        self.btn_snip.setObjectName("SecondaryBtn")
+        self.btn_snip.setFixedHeight(36)
+        self.btn_snip.setToolTip("Kéo chuột chọn nhanh 1 vùng bất kỳ trên màn hình để dịch (F8)")
+        self.btn_snip.clicked.connect(self.start_snip_region)
+
+        row_mode.addWidget(self.cb_mode, 1)
+        row_mode.addWidget(self.btn_snip)
+        col_mode.addWidget(lbl_mode)
+        col_mode.addLayout(row_mode)
+        c1_layout.addLayout(col_mode)
+
         row_auto = QHBoxLayout()
         self.chk_auto = QCheckBox("Auto-scan && translate every:")
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
@@ -754,9 +879,54 @@ class MainStudioWindow(QWidget):
         self.btn_translate.clicked.connect(self.initiate_capture_and_translate)
         root.addWidget(self.btn_translate)
 
-        self.lbl_status = QLabel("Ready • Position the Indigo HUD over target text and press F9")
+        self.lbl_status = QLabel("Ready • F8: Kéo chọn khung • F9: Dịch • F10: Khóa xuyên chuột")
         self.lbl_status.setObjectName("StatusPill")
         root.addWidget(self.lbl_status)
+
+    def on_capture_mode_changed(self, index: int):
+        self.clear_overlay_text()
+        if index == 1:
+            # Switching to Full Screen mode
+            if not self.overlay_hud.is_fullscreen:
+                self.saved_region_rect = self.overlay_hud.geometry()
+            screen = QApplication.screenAt(self.overlay_hud.geometry().center()) or QApplication.primaryScreen()
+            full_geo = screen.geometry()
+            self.overlay_hud.is_fullscreen = True
+            self.overlay_hud.setGeometry(full_geo)
+            self.overlay_hud.set_locked(True)
+            self.btn_lock.setText("🔒 Locked Click-Through (F10)")
+            self.btn_translate.setText("⚡ Scan && Translate Full Screen (F9)")
+            self.lbl_status.setText("🖥️ Chế độ Toàn màn hình: Bấm F9 để dịch toàn bộ màn hình.")
+        else:
+            # Switching to Region Box mode
+            self.overlay_hud.is_fullscreen = False
+            if self.saved_region_rect and self.saved_region_rect.width() >= 140:
+                self.overlay_hud.setGeometry(self.saved_region_rect)
+            self.overlay_hud.set_locked(False)
+            self.btn_lock.setText("🔓 Click-Through Lock (F10)")
+            self.btn_translate.setText("⚡ Scan && Translate Selected Region (F9)")
+            self.lbl_status.setText("🔲 Chế độ Khung HUD: Kéo/chỉnh khung hoặc bấm F8 để quét vùng mới.")
+
+    def start_snip_region(self):
+        screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+        self.overlay_hud.blocks = []
+        self.overlay_hud.update()
+        self.snipper.start_selection(screen.geometry())
+
+    def _on_region_snipped(self, rect: QRect):
+        self.saved_region_rect = rect
+        if self.cb_mode.currentIndex() != 0:
+            self.cb_mode.blockSignals(True)
+            self.cb_mode.setCurrentIndex(0)
+            self.cb_mode.blockSignals(False)
+        self.overlay_hud.is_fullscreen = False
+        self.overlay_hud.setGeometry(rect)
+        self.overlay_hud.set_locked(False)
+        self.btn_lock.setText("🔓 Click-Through Lock (F10)")
+        self.btn_translate.setText("⚡ Scan && Translate Selected Region (F9)")
+        self.overlay_hud.show()
+        self.overlay_hud.update()
+        QTimer.singleShot(60, self.initiate_capture_and_translate)
 
     def load_config(self):
         if not os.path.exists(self.config_path):
@@ -801,7 +971,14 @@ class MainStudioWindow(QWidget):
             hud_geo = cfg.get("overlay_hud") or cfg.get("overlay_hud_geometry")
             if isinstance(hud_geo, (list, tuple)) and len(hud_geo) == 4:
                 x, y, w, h = [int(v) for v in hud_geo]
-                self.overlay_hud.setGeometry(x, y, max(220, w), max(90, h))
+                self.saved_region_rect = QRect(x, y, max(220, w), max(90, h))
+                self.overlay_hud.setGeometry(self.saved_region_rect)
+
+            capture_mode = cfg.get("capture_mode", "region")
+            if capture_mode == "fullscreen":
+                self.cb_mode.setCurrentIndex(1)
+            else:
+                self.cb_mode.setCurrentIndex(0)
 
             if "update_url" in cfg and isinstance(cfg["update_url"], str):
                 self.update_url = normalize_github_raw_url(cfg["update_url"])
@@ -811,7 +988,9 @@ class MainStudioWindow(QWidget):
             print(f"Configuration load warning: {e}")
 
     def save_config(self):
-        geo = self.overlay_hud.geometry()
+        if not self.overlay_hud.is_fullscreen:
+            self.saved_region_rect = self.overlay_hud.geometry()
+        geo = self.saved_region_rect
         cfg = {
             "api_url": self.txt_url.text().strip(),
             "model_name": self.txt_model.text().strip(),
@@ -819,6 +998,7 @@ class MainStudioWindow(QWidget):
             "src_lang": self.cb_src.currentText(),
             "dst_lang": self.cb_dst.currentText(),
             "auto_interval": self.sp_interval.value(),
+            "capture_mode": "fullscreen" if self.cb_mode.currentIndex() == 1 else "region",
             "overlay_hud": [geo.x(), geo.y(), geo.width(), geo.height()],
             "update_url": self.update_url,
             "auto_update_on_start": self.auto_update_on_start
@@ -886,6 +1066,7 @@ class MainStudioWindow(QWidget):
     def _register_global_hotkeys(self):
         def listen():
             try:
+                keyboard.add_hotkey('F8', lambda: self.hotkey_bridge.trigger_snip.emit())
                 keyboard.add_hotkey('F9', lambda: self.hotkey_bridge.trigger_translate.emit())
                 keyboard.add_hotkey('F10', lambda: self.hotkey_bridge.trigger_lock.emit())
             except Exception as e:
@@ -921,8 +1102,10 @@ class MainStudioWindow(QWidget):
         if self.worker and self.worker.isRunning():
             return
 
-        # Phase 1: Hide overlay pills so underlying screen text is exposed cleanly
+        # Phase 1: Hide overlay pills (and Studio window if Full Screen) so screen text is exposed cleanly
         self.overlay_hud.is_capturing = True
+        if self.overlay_hud.is_fullscreen:
+            self.setWindowOpacity(0.0)
         self.overlay_hud.repaint()
         QApplication.processEvents()
 
@@ -947,12 +1130,16 @@ class MainStudioWindow(QWidget):
                 pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         except Exception as e:
             self.overlay_hud.is_capturing = False
+            if self.overlay_hud.is_fullscreen:
+                self.setWindowOpacity(1.0)
             self.overlay_hud.update()
             self.lbl_status.setText(f"Screen grab error: {e}")
             return
 
-        # Phase 2: Immediately restore overlay state
+        # Phase 2: Immediately restore overlay and Studio window state
         self.overlay_hud.is_capturing = False
+        if self.overlay_hud.is_fullscreen:
+            self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
         lang_map = ["eng", "chi_sim", "jpn", "kor"]
@@ -986,6 +1173,7 @@ class MainStudioWindow(QWidget):
 
     def closeEvent(self, event):
         self.save_config()
+        self.snipper.close()
         self.overlay_hud.close()
         event.accept()
 
