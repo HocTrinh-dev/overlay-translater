@@ -429,25 +429,44 @@ class TranslationKnowledgeManager:
 
         self.load()
 
+    DEFAULT_RAW_REPO_DIR = "https://raw.githubusercontent.com/HocTrinh-dev/overlay-translater/main"
+
     @classmethod
     def ensure_offline_dict_loaded(cls, dict_path=OFFLINE_DICT_FILE):
         with cls._SHARED_LOCK:
-            if cls._SHARED_OFFLINE_WORDS is not None:
+            if cls._SHARED_OFFLINE_WORDS:
                 return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+
+            # If running on a new PC where offline_en_vi.json hasn't been downloaded yet, auto-fetch from GitHub
+            if (
+                os.path.abspath(dict_path) == os.path.abspath(OFFLINE_DICT_FILE)
+                and (not os.path.isfile(dict_path) or os.path.getsize(dict_path) < 1_000_000)
+            ):
+                try:
+                    r = requests.get(f"{cls.DEFAULT_RAW_REPO_DIR}/offline_en_vi.json", timeout=45)
+                    if r.status_code == 200 and len(r.content) > 1_000_000:
+                        with open(dict_path, "wb") as f:
+                            f.write(r.content)
+                except Exception as e:
+                    print(f"Auto-download offline_en_vi.json warning: {e}")
+
             if os.path.exists(dict_path):
                 try:
                     with open(dict_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    cls._SHARED_OFFLINE_WORDS = data.get("words", {})
-                    cls._SHARED_OFFLINE_PHRASES = data.get("phrases", {})
-                    cls._SHARED_OFFLINE_META = data.get("meta", {})
-                    return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+                    words = data.get("words", {})
+                    phrases = data.get("phrases", {})
+                    meta = data.get("meta", {})
+                    if words:
+                        cls._SHARED_OFFLINE_WORDS = words
+                        cls._SHARED_OFFLINE_PHRASES = phrases
+                        cls._SHARED_OFFLINE_META = meta
+                        return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
                 except Exception as e:
                     print(f"Offline dictionary load warning: {e}")
-            cls._SHARED_OFFLINE_WORDS = {}
-            cls._SHARED_OFFLINE_PHRASES = {}
-            cls._SHARED_OFFLINE_META = {"word_count": 0, "phrase_count": 0, "total_entries": 0}
-            return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+
+            return {}, {}, {"word_count": 0, "phrase_count": 0, "total_entries": 0}
+
 
     def get_offline_dict_total_count(self) -> int:
         _, _, meta = self.ensure_offline_dict_loaded(self.offline_dict_path)
@@ -663,6 +682,20 @@ class TranslationKnowledgeManager:
                     if os.path.exists(fpath):
                         self.import_names_file(fpath, save_after=False)
 
+            # If running on a new PC where codex.json / Names.txt haven't been synced yet, auto-fetch from GitHub
+            if not self.codex_entries and os.path.abspath(self.codex_path) == os.path.abspath(CODEX_FILE):
+                try:
+                    r_codex = requests.get(f"{self.DEFAULT_RAW_REPO_DIR}/codex.json", timeout=20)
+                    if r_codex.status_code == 200 and len(r_codex.content) > 500:
+                        with open(self.codex_path, "wb") as f:
+                            f.write(r_codex.content)
+                        data = json.loads(r_codex.content.decode("utf-8"))
+                        if isinstance(data, dict):
+                            self.game_style = data.get("game_style", GAME_STYLE_PRESETS[0])
+                            self.codex_entries = data.get("entries", [])
+                except Exception as e:
+                    print(f"Auto-download codex.json warning: {e}")
+
             if os.path.exists(self.cache_path):
                 try:
                     with open(self.cache_path, "r", encoding="utf-8") as f:
@@ -671,6 +704,7 @@ class TranslationKnowledgeManager:
                         self.cache_data = data
                 except Exception as e:
                     print(f"Translation cache load warning: {e}")
+
 
     def save_codex(self):
         with self.lock:
@@ -1373,21 +1407,31 @@ class HotUpdateWorker(QThread):
                 return ""
         return ""
 
-    def _sync_missing_companion_files(self, script_dir: str):
-        """If running standalone .exe on another PC, fetch missing Codex / 133K Offline Dictionary from GitHub."""
+    def _sync_missing_companion_files(self, script_dir: str) -> bool:
+        """If running standalone .exe on another PC, fetch missing or empty Codex / 133K Offline Dictionary from GitHub."""
         if not self.update_url or "/" not in self.update_url:
-            return
+            return False
         base_raw_dir = self.update_url.rsplit("/", 1)[0]
-        for fname in ("codex.json", "Names.txt", "offline_en_vi.json"):
+        companion_specs = (
+            ("codex.json", 1000),
+            ("Names.txt", 1000),
+            ("offline_en_vi.json", 1_000_000),
+        )
+        updated_any = False
+        for fname, min_bytes in companion_specs:
             local_p = os.path.join(script_dir, fname)
-            if not os.path.isfile(local_p):
+            if not os.path.isfile(local_p) or os.path.getsize(local_p) < min_bytes:
                 try:
-                    r = requests.get(f"{base_raw_dir}/{fname}", timeout=25)
-                    if r.status_code == 200 and len(r.content) > 32:
+                    r = requests.get(f"{base_raw_dir}/{fname}", timeout=45)
+                    if r.status_code == 200 and len(r.content) >= min_bytes:
                         with open(local_p, "wb") as f:
                             f.write(r.content)
+                        updated_any = True
                 except Exception:
                     pass
+        if updated_any:
+            TranslationKnowledgeManager._SHARED_OFFLINE_WORDS = None
+        return updated_any
 
     def run(self):
         script_dir = os.path.dirname(self.target_script_path)
@@ -1423,7 +1467,7 @@ class HotUpdateWorker(QThread):
         # 3. Priority 2: Direct download via GitHub Raw URL (for standalone .exe without .git)
         if self.update_url:
             try:
-                self._sync_missing_companion_files(script_dir)
+                companion_synced = self._sync_missing_companion_files(script_dir)
                 cache_bust_url = (
                     f"{self.update_url}?t={int(time.time())}"
                     if "?" not in self.update_url
@@ -1443,7 +1487,13 @@ class HotUpdateWorker(QThread):
                     return
 
                 if new_code.replace("\r\n", "\n") == disk_code:
-                    self.finished_signal.emit(False, "✓ Already up to date with GitHub.")
+                    if companion_synced:
+                        self.finished_signal.emit(
+                            True,
+                            "✓ Đã tải xong Từ điển 133K từ & Bách khoa toàn thư từ GitHub! Đang nạp lại..."
+                        )
+                    else:
+                        self.finished_signal.emit(False, "✓ Already up to date with GitHub.")
                     return
 
                 with open(self.target_script_path, "w", encoding="utf-8") as f:
@@ -1456,6 +1506,7 @@ class HotUpdateWorker(QThread):
                 return
 
         self.finished_signal.emit(False, "NO_URL_CONFIGURED")
+
 
 
 
