@@ -734,9 +734,21 @@ class TestArgonOverlayTranslator(unittest.TestCase):
                 self.assertEqual(hits, 1)
                 self.assertEqual(out_lines, ["Chào mừng đến Đền Rồng", "Hãy tiêu diệt Trùm Bóng Tối"])
 
+            # 5. Verify Chat Box + Auto-Scan NEVER triggers auto-clear ("Đã tự xóa Overlay...") when chat scrolls/changes
+            studio.chk_auto.setChecked(True)
+            studio.chk_auto_clear.setChecked(True)
+            studio.overlay_hud.blocks = [prev_block]
+            studio.active_scene_sig = (10, 20, 30, 40, 50, 60)
+            with unittest.mock.patch.object(studio, "_grab_live_unmasked_signature", return_value=(210, 220, 230, 240, 250, 255)):
+                studio._check_scene_or_tab_change()
+                # Existing chat lines MUST stay visible on screen (never wiped to [])!
+                self.assertEqual(len(studio.overlay_hud.blocks), 1)
+                self.assertNotIn("Đã tự xóa Overlay", studio.lbl_status.text())
+
             studio.close()
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

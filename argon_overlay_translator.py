@@ -1705,13 +1705,17 @@ class FloatingOverlayHUD(QWidget):
                 outline_c = QColor(248, 250, 252, 245)
             return custom_fg, outline_c
 
+        bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
         if default_mode == "replace":
-            return (
-                QColor(fg_rgb[0], fg_rgb[1], fg_rgb[2], 255),
-                QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 245)
-            )
+            fg_lum = 0.299 * fg_rgb[0] + 0.587 * fg_rgb[1] + 0.114 * fg_rgb[2]
+            if abs(fg_lum - bg_lum) < 95:
+                fg_c = QColor(254, 249, 195, 255) if bg_lum < 145 else QColor(15, 23, 42, 255)
+            else:
+                fg_c = QColor(fg_rgb[0], fg_rgb[1], fg_rgb[2], 255)
+            outline_c = QColor(9, 13, 22, 240) if bg_lum < 145 else QColor(248, 250, 252, 240)
+            return fg_c, outline_c
+
         if default_mode == "transparent":
-            bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
             if bg_lum < 145:
                 return QColor(254, 249, 195, 255), QColor(9, 13, 22, 245)
             return QColor(15, 23, 42, 255), QColor(248, 250, 252, 245)
@@ -1788,51 +1792,100 @@ class FloatingOverlayHUD(QWidget):
         base_pt = max(6, min(48, int(self.font_size)))
         mask_alpha = max(0, min(255, int(self.bg_opacity * 255 / 100)))
 
-        for b in self.blocks:
+        # Sort blocks top-to-bottom so multi-line chat boxes never overlap or paint backgrounds over text
+        sorted_blocks = sorted(self.blocks, key=lambda item: (item['rect'][1], item['rect'][0]))
+        render_plan = []
+        n_blocks = len(sorted_blocks)
+
+        for idx, b in enumerate(sorted_blocks):
             rx, ry, rw, rh = b['rect']
             lx = int(rx / self.dpr)
             ly = int(ry / self.dpr)
             orig_lw = max(int(rw / self.dpr), 28)
-            orig_lh = max(int(rh / self.dpr), 18)
+            orig_lh = max(int(rh / self.dpr), 16)
 
             text = b['text']
             bg_rgb = b.get('bg_color', (15, 23, 42))
             fg_rgb = b.get('fg_color', (248, 250, 252))
 
+            # Check vertical slot before the next chat line below this block
+            next_ly = None
+            for j in range(idx + 1, n_blocks):
+                nrx, nry, nrw, _ = sorted_blocks[j]['rect']
+                nlx = int(nrx / self.dpr)
+                nly = int(nry / self.dpr)
+                if nly > ly + 4 and abs(nlx - lx) < max(orig_lw, int(nrw / self.dpr), 180):
+                    next_ly = nly
+                    break
+
+            slot_h = (next_ly - ly - 1) if next_ly is not None else max(orig_lh + 36, base_pt * 4)
+            slot_h = max(14, slot_h)
+
             target_font_size = base_pt
-            max_avail_w = max(orig_lw + 60, min(orig_lw + 160, w - lx - 4))
+            max_avail_w = max(orig_lw + 60, w - lx - 6)
             font = QFont(self.font_family, target_font_size, weight)
             fm = QFontMetrics(font)
 
-            if self.auto_font_fit:
+            if self.auto_font_fit or (next_ly is not None and slot_h <= 32):
                 min_shrink_pt = max(7, base_pt - 5)
-                while target_font_size > min_shrink_pt and fm.horizontalAdvance(text) > max_avail_w * 1.35:
+                while target_font_size > min_shrink_pt:
+                    t_rect = fm.boundingRect(
+                        QRect(lx, ly, max_avail_w, max(orig_lh + 36, target_font_size * 4)),
+                        Qt.TextWordWrap,
+                        text
+                    )
+                    if t_rect.height() <= slot_h and fm.horizontalAdvance(text) <= max_avail_w * 1.25:
+                        break
                     target_font_size -= 1
                     font = QFont(self.font_family, target_font_size, weight)
                     fm = QFontMetrics(font)
 
-            painter.setFont(font)
             text_rect = fm.boundingRect(
                 QRect(lx, ly, max_avail_w, max(orig_lh + 36, target_font_size * 4)),
                 Qt.TextWordWrap,
                 text
             )
             draw_w = max(orig_lw, min(text_rect.width() + 12, w - lx - 2))
-            draw_h = max(orig_lh, text_rect.height() + 4)
+            draw_h = max(orig_lh, text_rect.height() + 2)
+            if next_ly is not None and ly + draw_h > next_ly:
+                draw_h = max(14, next_ly - ly)
+
             b['painted_phys_rect'] = (
-                max(0, int((lx - 6) * self.dpr)),
-                max(0, int((ly - 4) * self.dpr)),
-                int((draw_w + 12) * self.dpr),
-                int((draw_h + 8) * self.dpr)
+                max(0, int((lx - 2) * self.dpr)),
+                max(0, int((ly - 1) * self.dpr)),
+                int((draw_w + 4) * self.dpr),
+                int((draw_h + 2) * self.dpr)
             )
+            render_plan.append({
+                'block': b,
+                'lx': lx,
+                'ly': ly,
+                'orig_lw': orig_lw,
+                'orig_lh': orig_lh,
+                'draw_w': draw_w,
+                'draw_h': draw_h,
+                'text': text,
+                'bg_rgb': bg_rgb,
+                'fg_rgb': fg_rgb,
+                'font': font,
+            })
 
-            if self.overlay_style == "replace":
-                # 1. Erase original foreign text on image using chameleon sampled background color (zero border)
-                if mask_alpha > 0:
-                    painter.setPen(Qt.NoPen)
+        # PASS 1: Draw all background masks / pills FIRST so no background ever covers adjacent line text!
+        if mask_alpha > 0 and self.overlay_style in ("replace", "glass"):
+            painter.setPen(Qt.NoPen)
+            for item in render_plan:
+                b = item['block']
+                lx, ly = item['lx'], item['ly']
+                orig_lw, orig_lh = item['orig_lw'], item['orig_lh']
+                draw_w, draw_h = item['draw_w'], item['draw_h']
+                bg_rgb = item['bg_rgb']
+
+                if self.overlay_style == "replace":
                     painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], mask_alpha)))
-                    painter.drawRoundedRect(QRectF(lx - 2, ly - 1, orig_lw + 4, orig_lh + 2), 3, 3)
-
+                    painter.drawRoundedRect(
+                        QRectF(lx - 2, ly - 1, max(orig_lw, draw_w) + 4, max(orig_lh, draw_h) + 1),
+                        3, 3
+                    )
                     for wm in b.get('word_masks', []):
                         wx, wy, ww, wh = wm['rect']
                         w_bg = wm.get('bg_color', bg_rgb)
@@ -1846,46 +1899,26 @@ class FloatingOverlayHUD(QWidget):
                             ),
                             2, 2
                         )
-
-                # 2. Draw translated text directly in-place on transparent background with chameleon outline
-                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "replace")
-                self._draw_outlined_text(
-                    painter,
-                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
-                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
-                    text,
-                    fg_qcolor,
-                    outline_qcolor
-                )
-
-            elif self.overlay_style == "transparent":
-                # 100% Transparent background (no fill), crisp halo-outlined text
-                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "transparent")
-                self._draw_outlined_text(
-                    painter,
-                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
-                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
-                    text,
-                    fg_qcolor,
-                    outline_qcolor
-                )
-
-            else:
-                # Semi-transparent glass pill
-                bg_rect = QRectF(lx - 3, ly - 1, draw_w + 6, draw_h + 2)
-                if mask_alpha > 0:
-                    painter.setPen(Qt.NoPen)
+                elif self.overlay_style == "glass":
+                    bg_rect = QRectF(lx - 3, ly - 1, draw_w + 6, draw_h + 1)
                     painter.setBrush(QBrush(QColor(11, 15, 25, mask_alpha)))
                     painter.drawRoundedRect(bg_rect, 4, 4)
-                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "glass")
-                self._draw_outlined_text(
-                    painter,
-                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
-                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
-                    text,
-                    fg_qcolor,
-                    outline_qcolor
-                )
+
+        # PASS 2: Draw all translated text ON TOP of all backgrounds
+        mode_key = self.overlay_style if self.overlay_style in ("replace", "transparent") else "glass"
+        for item in render_plan:
+            painter.setFont(item['font'])
+            fg_qcolor, outline_qcolor = self._resolve_colors_for_block(
+                item['bg_rgb'], item['fg_rgb'], mode_key
+            )
+            self._draw_outlined_text(
+                painter,
+                QRectF(item['lx'], item['ly'] - 1, item['draw_w'], item['draw_h'] + 2),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+                item['text'],
+                fg_qcolor,
+                outline_qcolor
+            )
 
     def _hit_test_resize_edge(self, pos: QPoint) -> str:
         """
@@ -3391,7 +3424,7 @@ class MainStudioWindow(QWidget):
                 keyboard.add_hotkey('F8', lambda: self.hotkey_bridge.trigger_snip.emit())
                 keyboard.add_hotkey('F9', lambda: self.hotkey_bridge.trigger_translate.emit())
                 keyboard.add_hotkey('F10', lambda: self.hotkey_bridge.trigger_lock.emit())
-                for nav_key in ('alt+tab', 'ctrl+tab', 'ctrl+shift+tab', 'ctrl+w', 'ctrl+t', 'page up', 'page down'):
+                for nav_key in ('ctrl+tab', 'ctrl+shift+tab'):
                     try:
                         keyboard.add_hotkey(nav_key, lambda: self.hotkey_bridge.trigger_tab_switched.emit(), suppress=False)
                     except Exception:
@@ -3461,11 +3494,15 @@ class MainStudioWindow(QWidget):
 
     def on_scene_or_tab_changed(self):
         """
-        Automatically wipe stale overlay translation blocks the instant the user switches tabs,
-        scrolls, or changes windows/menus so old translations never clutter the new screen.
-        If Auto-Scan is enabled, immediately schedule a fresh scan of the new tab.
+        Automatically wipe stale overlay translation blocks when the user switches tabs in manual mode.
+        When Auto-Scan is active (e.g. translating a live Chat Box), NEVER wipe the overlay to blank —
+        keep existing chat lines readable on screen and trigger a background scan to update in-place.
         """
         if not self.chk_auto_clear.isChecked() or not self.overlay_hud.blocks:
+            return
+        if self.chk_auto.isChecked():
+            if not (self.worker and self.worker.isRunning()):
+                QTimer.singleShot(120, self.initiate_capture_and_translate)
             return
         self.overlay_hud.blocks = []
         self.last_valid_blocks = []
@@ -3474,8 +3511,6 @@ class MainStudioWindow(QWidget):
         self.active_scene_sig = None
         self.overlay_hud.update()
         self.lbl_status.setText("🧹 Đã tự xóa Overlay do chuyển Tab / đổi nội dung màn hình.")
-        if self.chk_auto.isChecked() and not (self.worker and self.worker.isRunning()):
-            QTimer.singleShot(220, self.initiate_capture_and_translate)
 
     def toggle_auto_timer(self, state):
         if state == Qt.Checked:
@@ -3520,10 +3555,10 @@ class MainStudioWindow(QWidget):
         for b in (blocks or []):
             if "painted_phys_rect" in b:
                 px, py, pw, ph = b["painted_phys_rect"]
-                masked_rects.append((px - 4, py - 4, px + pw + 8, py + ph + 8))
+                masked_rects.append((px - 2, py - 2, px + pw + 4, py + ph + 4))
             elif "rect" in b:
                 rx, ry, rw, rh = b["rect"]
-                masked_rects.append((rx - 10, ry - 8, rx + rw + 180, ry + rh + 48))
+                masked_rects.append((rx - 8, ry - 6, rx + rw + 160, ry + rh + 36))
 
         samples = []
         margin_x = min(14, img_w // 6)
@@ -3636,7 +3671,7 @@ class MainStudioWindow(QWidget):
         if self.overlay_hud.blocks and self.active_scene_sig:
             live_sig = self._grab_live_unmasked_signature()
             if live_sig and len(live_sig) == len(self.active_scene_sig):
-                if self.frame_signature_diff(live_sig, self.active_scene_sig) < 3.8:
+                if self.frame_signature_diff(live_sig, self.active_scene_sig) < 2.2:
                     self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ chưa đổi (Giữ nguyên bản dịch, không quét lại)")
                     return
 
@@ -3654,8 +3689,9 @@ class MainStudioWindow(QWidget):
     def _check_scene_or_tab_change(self):
         """
         Periodic 260ms non-intrusive check:
-        1. If translation pills are on screen and the user switches tabs/scrolls, clear stale overlay immediately.
-        2. If Auto-Scan is enabled on an empty screen and new text/UI appears, trigger translation immediately.
+        1. When Auto-Scan is OFF (manual F9 mode) and not in Chat Box mode, clear stale overlay if the user switches tabs.
+        2. When Auto-Scan is ON (or in Chat Box mode), NEVER wipe existing chat blocks on screen — keep them readable!
+        3. If Auto-Scan is enabled on an empty screen and new text/UI appears, trigger translation immediately.
         """
         if (
             self.overlay_hud.is_capturing
@@ -3665,7 +3701,12 @@ class MainStudioWindow(QWidget):
             return
 
         if self.overlay_hud.blocks:
-            if not self.chk_auto_clear.isChecked():
+            # Never auto-wipe overlay blocks when Auto-Scan is active or when translating a Multi-Language Chat Box!
+            if (
+                not self.chk_auto_clear.isChecked()
+                or self.chk_auto.isChecked()
+                or "multi" in self.cb_src.currentText().lower()
+            ):
                 return
             live_sig = self._grab_live_unmasked_signature()
             if not live_sig:
@@ -3673,7 +3714,7 @@ class MainStudioWindow(QWidget):
             if not self.active_scene_sig or len(live_sig) != len(self.active_scene_sig):
                 self.active_scene_sig = live_sig
                 return
-            if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 4.0:
+            if self.frame_signature_diff(live_sig, self.active_scene_sig) >= 22.0:
                 self.on_scene_or_tab_changed()
         elif self.chk_auto.isChecked() and self.last_frame_sig is not None:
             raw_img = self._grab_raw_hud_image()
@@ -3732,13 +3773,7 @@ class MainStudioWindow(QWidget):
             else 999.0
         )
 
-        # If a major scene/tab change occurred (frame_diff >= 4.0), hide stale blocks while OCR runs,
-        # but PRESERVE self.last_raw_text so if the OCR text is still the same old text, it won't re-translate!
-        if frame_diff >= 4.0 and self.overlay_hud.blocks:
-            self.overlay_hud.blocks = []
-            self.active_scene_sig = None
-
-        # Phase 2: Restore overlay and Studio window state
+        # Phase 2: Immediately restore overlay and Studio window state so existing chat lines stay readable on screen
         self.overlay_hud.is_capturing = False
         if self.overlay_hud.is_fullscreen:
             self.setWindowOpacity(1.0)
@@ -3748,7 +3783,7 @@ class MainStudioWindow(QWidget):
         if (
             self.chk_auto.isChecked()
             and self.last_frame_sig is not None
-            and frame_diff < 2.2
+            and frame_diff < 1.8
         ):
             self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ không đổi (Bỏ qua OCR & giữ nguyên bản dịch)")
             return
