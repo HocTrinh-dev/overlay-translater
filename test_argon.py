@@ -404,6 +404,35 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         search_hits = mgr.search_codex("dragon")
         self.assertGreater(len(search_hits), 5)
 
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_chameleon_in_place_text_replacement_and_transparent_styles(self, mock_hotkey):
+        """Verify chameleon background color sampling and switching between Replace, Transparent, and Glass overlay styles."""
+        # Create a light parchment background image (240, 230, 200) with dark ink text pixels in the middle
+        img = Image.new("RGB", (200, 60), color=(240, 230, 200))
+        for x in range(30, 150):
+            img.putpixel((x, 25), (20, 15, 10))
+        bg_rgb, fg_rgb = aot.TranslationWorker.sample_rect_colors(img, (25, 15, 130, 22))
+        self.assertEqual(bg_rgb, (240, 230, 200))
+        self.assertLess(fg_rgb[0], 50)
+
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        studio.overlay_hud.blocks = [{
+            "rect": (20, 20, 120, 24),
+            "text": "Huyết Kiếm",
+            "raw": "Crimson Blade",
+            "raw_line": "Crimson Blade",
+            "bg_color": bg_rgb,
+            "fg_color": fg_rgb,
+            "word_masks": [{"rect": (20, 20, 120, 24), "bg_color": bg_rgb}],
+        }]
+
+        for idx, expected_style in ((0, "replace"), (1, "transparent"), (2, "glass")):
+            studio.cb_overlay_style.setCurrentIndex(idx)
+            self.assertEqual(studio.overlay_hud.overlay_style, expected_style)
+            studio.overlay_hud.repaint()
+
+        studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

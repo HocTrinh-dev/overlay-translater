@@ -919,9 +919,19 @@ class TranslationWorker(QThread):
             min_y = min(item['rect'][1] for item in line_items)
             max_x = max(item['rect'][0] + item['rect'][2] for item in line_items)
             max_y = max(item['rect'][1] + item['rect'][3] for item in line_items)
+            line_rect = (min_x, min_y, max_x - min_x, max_y - min_y)
+            bg_color, fg_color = self.sample_rect_colors(self.pil_img, line_rect)
+            word_masks = []
+            for w_item in line_items:
+                w_bg, _ = self.sample_rect_colors(self.pil_img, w_item['rect'])
+                word_masks.append({'rect': w_item['rect'], 'bg_color': w_bg})
+
             line_entries.append({
-                'rect': (min_x, min_y, max_x - min_x, max_y - min_y),
-                'raw_text': line_str
+                'rect': line_rect,
+                'raw_text': line_str,
+                'bg_color': bg_color,
+                'fg_color': fg_color,
+                'word_masks': word_masks
             })
 
         if not line_entries:
@@ -946,7 +956,10 @@ class TranslationWorker(QThread):
                 'rect': entry['rect'],
                 'text': trans_text,
                 'raw': combined_raw,
-                'raw_line': entry['raw_text']
+                'raw_line': entry['raw_text'],
+                'bg_color': entry.get('bg_color', (15, 23, 42)),
+                'fg_color': entry.get('fg_color', (248, 250, 252)),
+                'word_masks': entry.get('word_masks', [])
             })
 
         timestamp = time.strftime('%H:%M:%S')
@@ -956,6 +969,77 @@ class TranslationWorker(QThread):
             overlay_blocks,
             f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Cache: {cache_hits}/{len(raw_list)} • AI mới: {ai_calls}{skip_note})"
         )
+
+    @staticmethod
+    def sample_rect_colors(pil_img, rect):
+        """
+        Sample perimeter pixels around `rect = (x, y, w, h)` in `pil_img` to determine:
+        - `bg_color`: median (R, G, B) of the background immediately surrounding the text so we can erase original text seamlessly.
+        - `fg_color`: high-contrast (R, G, B) of the text ink (or auto white/dark).
+        """
+        if pil_img is None:
+            return (15, 23, 42), (248, 250, 252)
+        try:
+            img_w, img_h = pil_img.size
+            if img_w <= 0 or img_h <= 0:
+                return (15, 23, 42), (248, 250, 252)
+
+            rx, ry, rw, rh = rect
+            x0 = max(0, min(img_w - 1, int(rx)))
+            y0 = max(0, min(img_h - 1, int(ry)))
+            x1 = max(0, min(img_w - 1, int(rx + rw)))
+            y1 = max(0, min(img_h - 1, int(ry + rh)))
+
+            top_y = max(0, y0 - 2)
+            bot_y = min(img_h - 1, y1 + 2)
+            left_x = max(0, x0 - 2)
+            right_x = min(img_w - 1, x1 + 2)
+
+            border_pixels = []
+            step_x = max(1, (x1 - x0) // 12)
+            for px in range(x0, x1 + 1, step_x):
+                border_pixels.append(pil_img.getpixel((px, top_y))[:3])
+                border_pixels.append(pil_img.getpixel((px, bot_y))[:3])
+
+            step_y = max(1, (y1 - y0) // 6)
+            for py in range(y0, y1 + 1, step_y):
+                border_pixels.append(pil_img.getpixel((left_x, py))[:3])
+                border_pixels.append(pil_img.getpixel((right_x, py))[:3])
+
+            if not border_pixels:
+                border_pixels = [pil_img.getpixel((x0, y0))[:3]]
+
+            rs = sorted(p[0] for p in border_pixels)
+            gs = sorted(p[1] for p in border_pixels)
+            bs = sorted(p[2] for p in border_pixels)
+            mid = len(border_pixels) // 2
+            bg_r, bg_g, bg_b = rs[mid], gs[mid], bs[mid]
+            bg_lum = 0.299 * bg_r + 0.587 * bg_g + 0.114 * bg_b
+
+            mid_y = (y0 + y1) // 2
+            ink_candidates = []
+            step_in = max(1, (x1 - x0) // 18)
+            for px in range(x0, x1 + 1, step_in):
+                pr, pg, pb = pil_img.getpixel((px, mid_y))[:3]
+                dist = abs(pr - bg_r) + abs(pg - bg_g) + abs(pb - bg_b)
+                if dist > 85:
+                    ink_candidates.append((dist, pr, pg, pb))
+
+            if ink_candidates:
+                ink_candidates.sort(key=lambda t: t[0], reverse=True)
+                top_ink = ink_candidates[: max(1, len(ink_candidates) // 2)]
+                fg_r = sum(t[1] for t in top_ink) // len(top_ink)
+                fg_g = sum(t[2] for t in top_ink) // len(top_ink)
+                fg_b = sum(t[3] for t in top_ink) // len(top_ink)
+                fg_lum = 0.299 * fg_r + 0.587 * fg_g + 0.114 * fg_b
+                if abs(fg_lum - bg_lum) >= 75:
+                    return (bg_r, bg_g, bg_b), (fg_r, fg_g, fg_b)
+
+            if bg_lum < 140:
+                return (bg_r, bg_g, bg_b), (250, 252, 255)
+            return (bg_r, bg_g, bg_b), (15, 23, 42)
+        except Exception:
+            return (15, 23, 42), (248, 250, 252)
 
     def resolve_with_cache_and_translate(self, text_lines: list):
         """Check local Cache/Codex first; only send uncached lines to AI/Google, then persist new translations."""
@@ -1181,6 +1265,7 @@ class FloatingOverlayHUD(QWidget):
         self.resizing = False
         self.drag_offset = None
         self.dpr = 1.0
+        self.overlay_style = "replace"  # "replace" (In-Place Chameleon), "transparent" (Halo Text Only), "glass" (Translucent Pill)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -1205,6 +1290,14 @@ class FloatingOverlayHUD(QWidget):
         self.show()
         self.update()
 
+    @staticmethod
+    def _draw_outlined_text(painter: QPainter, rect: QRectF, flags: int, text: str, fg_color: QColor, outline_color: QColor):
+        painter.setPen(outline_color)
+        for dx, dy in ((-1.5, -1.5), (0, -1.5), (1.5, -1.5), (-1.5, 0), (1.5, 0), (-1.5, 1.5), (0, 1.5), (1.5, 1.5)):
+            painter.drawText(rect.adjusted(dx, dy, dx, dy), flags, text)
+        painter.setPen(fg_color)
+        painter.drawText(rect, flags, text)
+
     def paintEvent(self, event):
         if self.is_capturing:
             return
@@ -1216,61 +1309,128 @@ class FloatingOverlayHUD(QWidget):
         w, h = self.width(), self.height()
 
         if not self.is_locked and not self.is_fullscreen:
-            pen = QPen(QColor(99, 102, 241, 210), 1.5, Qt.SolidLine)
+            pen = QPen(QColor(99, 102, 241, 175), 1.5, Qt.DashLine)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(15, 23, 42, 25)))
+            # Alpha=1 keeps the interior 99.6% transparent while still catching mouse drag events on Windows
+            painter.setBrush(QBrush(QColor(0, 0, 0, 1)))
             painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
 
-            badge_rect = QRectF(8, 8, 285, 24)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
-            painter.drawRoundedRect(badge_rect, 6, 6)
+            if not self.blocks:
+                badge_rect = QRectF(8, 8, 295, 24)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(15, 23, 42, 175)))
+                painter.drawRoundedRect(badge_rect, 6, 6)
 
-            painter.setPen(QColor(226, 232, 240))
-            painter.setFont(QFont("Segoe UI", 8, QFont.DemiBold))
-            painter.drawText(
-                badge_rect.adjusted(10, 0, -6, 0),
-                Qt.AlignVCenter | Qt.AlignLeft,
-                "⚡ Drag to move • F8: Snip • F9: Translate • F10: Lock"
-            )
+                painter.setPen(QColor(226, 232, 240))
+                painter.setFont(QFont("Segoe UI", 8, QFont.DemiBold))
+                painter.drawText(
+                    badge_rect.adjusted(10, 0, -6, 0),
+                    Qt.AlignVCenter | Qt.AlignLeft,
+                    "⚡ Kéo khung • F8: Quét vùng • F9: Dịch • F10: Khóa"
+                )
 
             grip_path = QPainterPath()
             grip_path.moveTo(w - 16, h - 3)
             grip_path.lineTo(w - 3, h - 16)
             grip_path.moveTo(w - 10, h - 3)
             grip_path.lineTo(w - 3, h - 10)
-            painter.setPen(QPen(QColor(129, 140, 248, 230), 2, Qt.SolidLine, Qt.RoundCap))
+            painter.setPen(QPen(QColor(129, 140, 248, 220), 2, Qt.SolidLine, Qt.RoundCap))
             painter.drawPath(grip_path)
 
         for b in self.blocks:
             rx, ry, rw, rh = b['rect']
             lx = int(rx / self.dpr)
             ly = int(ry / self.dpr)
-            lw = max(int(rw / self.dpr), 80)
-            lh = max(int(rh / self.dpr), 24)
+            orig_lw = max(int(rw / self.dpr), 28)
+            orig_lh = max(int(rh / self.dpr), 18)
 
             text = b['text']
+            bg_rgb = b.get('bg_color', (15, 23, 42))
+            fg_rgb = b.get('fg_color', (248, 250, 252))
 
-            font_size = max(9, min(14, int(lh * 0.52)))
-            font = QFont("Segoe UI", font_size, QFont.DemiBold)
-            painter.setFont(font)
+            # Auto-fit font size so translated text fits cleanly over the original text position
+            target_font_size = max(9, min(18, int(orig_lh * 0.60)))
+            max_avail_w = max(orig_lw + 60, min(orig_lw + 140, w - lx - 4))
+            font = QFont("Segoe UI", target_font_size, QFont.Bold)
             fm = QFontMetrics(font)
+            while target_font_size > 8 and fm.horizontalAdvance(text) > max_avail_w * 1.35:
+                target_font_size -= 1
+                font = QFont("Segoe UI", target_font_size, QFont.Bold)
+                fm = QFontMetrics(font)
 
-            text_rect = fm.boundingRect(QRect(lx, ly, lw + 120, lh + 20), Qt.TextWordWrap, text)
-            box_w = max(lw, min(text_rect.width() + 16, w - lx - 6))
-            box_h = max(lh, text_rect.height() + 8)
-
-            bg_rect = QRectF(lx - 4, ly - 2, box_w + 8, box_h + 4)
-            painter.setPen(QPen(QColor(99, 102, 241, 90), 1))
-            painter.setBrush(QBrush(QColor(11, 15, 25, 238)))
-            painter.drawRoundedRect(bg_rect, 5, 5)
-
-            painter.setPen(QColor(248, 250, 252))
-            painter.drawText(
-                QRectF(lx + 2, ly, box_w - 4, box_h),
-                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+            painter.setFont(font)
+            text_rect = fm.boundingRect(
+                QRect(lx, ly, max_avail_w, orig_lh + 24),
+                Qt.TextWordWrap,
                 text
             )
+            draw_w = max(orig_lw, min(text_rect.width() + 10, w - lx - 2))
+            draw_h = max(orig_lh, text_rect.height() + 4)
+
+            if self.overlay_style == "replace":
+                # 1. Erase original foreign text on image using chameleon sampled background color (zero border)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 248)))
+                painter.drawRoundedRect(QRectF(lx - 2, ly - 1, orig_lw + 4, orig_lh + 2), 3, 3)
+
+                for wm in b.get('word_masks', []):
+                    wx, wy, ww, wh = wm['rect']
+                    w_bg = wm.get('bg_color', bg_rgb)
+                    painter.setBrush(QBrush(QColor(w_bg[0], w_bg[1], w_bg[2], 252)))
+                    painter.drawRoundedRect(
+                        QRectF(
+                            int(wx / self.dpr) - 2,
+                            int(wy / self.dpr) - 1,
+                            max(4, int(ww / self.dpr) + 4),
+                            max(4, int(wh / self.dpr) + 2)
+                        ),
+                        2, 2
+                    )
+
+                # 2. Draw translated text directly in-place on transparent background with chameleon outline
+                fg_qcolor = QColor(fg_rgb[0], fg_rgb[1], fg_rgb[2], 255)
+                outline_qcolor = QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 245)
+                self._draw_outlined_text(
+                    painter,
+                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
+                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+                    text,
+                    fg_qcolor,
+                    outline_qcolor
+                )
+
+            elif self.overlay_style == "transparent":
+                # 100% Transparent background (no fill), crisp halo-outlined text
+                bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+                if bg_lum < 145:
+                    fg_qcolor = QColor(254, 249, 195, 255)
+                    outline_qcolor = QColor(9, 13, 22, 245)
+                else:
+                    fg_qcolor = QColor(15, 23, 42, 255)
+                    outline_qcolor = QColor(248, 250, 252, 245)
+                self._draw_outlined_text(
+                    painter,
+                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
+                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+                    text,
+                    fg_qcolor,
+                    outline_qcolor
+                )
+
+            else:
+                # Semi-transparent glass pill
+                bg_rect = QRectF(lx - 3, ly - 1, draw_w + 6, draw_h + 2)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(11, 15, 25, 135)))
+                painter.drawRoundedRect(bg_rect, 4, 4)
+                self._draw_outlined_text(
+                    painter,
+                    QRectF(lx, ly - 1, draw_w, draw_h + 2),
+                    Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+                    text,
+                    QColor(248, 250, 252, 255),
+                    QColor(11, 15, 25, 230)
+                )
 
     def mousePressEvent(self, event):
         if self.is_locked or self.is_fullscreen:
@@ -2099,6 +2259,23 @@ class MainStudioWindow(QWidget):
         col_mode.addLayout(row_mode)
         c1_layout.addLayout(col_mode)
 
+        col_style = QVBoxLayout()
+        col_style.setSpacing(6)
+        lbl_style_mode = QLabel("Overlay Style (Kiểu hiển thị chữ dịch trên hình):")
+        lbl_style_mode.setObjectName("FieldLabel")
+        self.cb_overlay_style = QComboBox()
+        self.cb_overlay_style.setView(QListView())
+        self.cb_overlay_style.setFixedHeight(36)
+        self.cb_overlay_style.addItems([
+            "🎨 Thay chữ trực tiếp trên hình (Xóa chữ gốc + Nền tiệp màu)",
+            "👻 Nền trong suốt 100% (Chỉ hiện chữ dịch có viền)",
+            "🕶️ Khung kính mờ trong suốt (Semi-Transparent)"
+        ])
+        self.cb_overlay_style.currentIndexChanged.connect(self.on_overlay_style_changed)
+        col_style.addWidget(lbl_style_mode)
+        col_style.addWidget(self.cb_overlay_style)
+        c1_layout.addLayout(col_style)
+
         row_auto = QHBoxLayout()
         self.chk_auto = QCheckBox("Auto-scan && translate every:")
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
@@ -2220,6 +2397,11 @@ class MainStudioWindow(QWidget):
             self.overlay_hud.update()
             self.lbl_status.setText("✓ Đã cập nhật trực tiếp bản dịch mới lên màn hình Overlay!")
 
+    def on_overlay_style_changed(self, index: int):
+        style_map = {0: "replace", 1: "transparent", 2: "glass"}
+        self.overlay_hud.overlay_style = style_map.get(index, "replace")
+        self.overlay_hud.update()
+
     def on_capture_mode_changed(self, index: int):
         self.clear_overlay_text()
         if index == 1:
@@ -2317,6 +2499,10 @@ class MainStudioWindow(QWidget):
             else:
                 self.cb_mode.setCurrentIndex(0)
 
+            overlay_style = cfg.get("overlay_style", "replace")
+            style_idx_map = {"replace": 0, "transparent": 1, "glass": 2}
+            self.cb_overlay_style.setCurrentIndex(style_idx_map.get(overlay_style, 0))
+
             if "update_url" in cfg and isinstance(cfg["update_url"], str):
                 self.update_url = normalize_github_raw_url(cfg["update_url"])
             if "auto_update_on_start" in cfg and isinstance(cfg["auto_update_on_start"], bool):
@@ -2328,6 +2514,7 @@ class MainStudioWindow(QWidget):
         if not self.overlay_hud.is_fullscreen:
             self.saved_region_rect = self.overlay_hud.geometry()
         geo = self.saved_region_rect
+        style_map = {0: "replace", 1: "transparent", 2: "glass"}
         cfg = {
             "api_url": self.txt_url.text().strip(),
             "model_name": self.txt_model.text().strip(),
@@ -2336,6 +2523,7 @@ class MainStudioWindow(QWidget):
             "dst_lang": self.cb_dst.currentText(),
             "auto_interval": self.sp_interval.value(),
             "capture_mode": "fullscreen" if self.cb_mode.currentIndex() == 1 else "region",
+            "overlay_style": style_map.get(self.cb_overlay_style.currentIndex(), "replace"),
             "overlay_hud": [geo.x(), geo.y(), geo.width(), geo.height()],
             "update_url": self.update_url,
             "auto_update_on_start": self.auto_update_on_start
