@@ -374,6 +374,36 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             self.assertIsNotNone(getattr(app, "_active_studio", None))
             app._active_studio.close()
 
+    def test_massive_133k_offline_en_vi_dictionary_and_sentence_translator(self):
+        """Verify 133,675-entry offline English-Vietnamese dictionary lookup, stemming, search, and offline sentence translation."""
+        mgr = aot.TranslationKnowledgeManager(
+            codex_path=os.path.join(self.temp_dir.name, "codex.json"),
+            cache_path=os.path.join(self.temp_dir.name, "cache.json"),
+        )
+        self.assertGreater(mgr.get_offline_dict_total_count(), 100000)
+
+        # 1. Exact and stemmed word lookup in 133K dictionary
+        sword_info = mgr.lookup_offline_en_vi("swords")
+        self.assertIsNotNone(sword_info)
+        self.assertEqual(sword_info["source"], "sword")
+        self.assertIn("kiếm", sword_info["concise"])
+
+        # 2. Phrase lookup in 30K offline phrases
+        phrase_info = mgr.lookup_offline_en_vi("to abandon a hope")
+        self.assertIsNotNone(phrase_info)
+        self.assertIn("từ bỏ hy vọng", phrase_info["concise"])
+
+        # 3. 100% Offline sentence translation combining Codex + 133K dictionary
+        mgr.add_or_update_codex("Crimson Blade", "Huyết Kiếm", "Vật phẩm (Item)")
+        offline_sent = mgr.translate_sentence_offline("You can abandon a hope or wield the Crimson Blade!")
+        self.assertIn("bạn", offline_sent.lower())
+        self.assertIn("từ bỏ hy vọng", offline_sent.lower())
+        self.assertIn("Huyết Kiếm", offline_sent)
+
+        # 4. Searching in Codex returns matches from the 133K dictionary
+        search_hits = mgr.search_codex("dragon")
+        self.assertGreater(len(search_hits), 5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

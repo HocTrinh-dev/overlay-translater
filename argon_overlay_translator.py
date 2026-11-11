@@ -44,6 +44,7 @@ else:
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CODEX_FILE = os.path.join(APP_DIR, "codex.json")
 CACHE_FILE = os.path.join(APP_DIR, "translation_cache.json")
+OFFLINE_DICT_FILE = os.path.join(APP_DIR, "offline_en_vi.json")
 MAIN_SCRIPT_FILE = os.path.join(APP_DIR, "argon_overlay_translator.py")
 
 STARTUP_SCRIPT_SNAPSHOT = ""
@@ -193,13 +194,50 @@ class TranslationKnowledgeManager:
     """
     Thread-safe local knowledge base combining:
     1. Game Encyclopedia / Codex (`codex.json` + `Names.txt` hybrid) for lookup & prompt injection.
-    2. Persistent LRU + Fuzzy OCR Translation Memory (`translation_cache.json`) to avoid redundant AI calls.
-    3. Sliding-window recent dialogue context for cross-frame narrative continuity.
+    2. Massive Offline English-Vietnamese Dictionary (`offline_en_vi.json` - 133,675 words & phrases).
+    3. Persistent LRU + Fuzzy OCR Translation Memory (`translation_cache.json`) to avoid redundant AI calls.
+    4. Sliding-window recent dialogue context for cross-frame narrative continuity.
     """
 
-    def __init__(self, codex_path=CODEX_FILE, cache_path=CACHE_FILE, max_cache_size=5000):
+    _SHARED_OFFLINE_WORDS = None
+    _SHARED_OFFLINE_PHRASES = None
+    _SHARED_OFFLINE_META = None
+    _SHARED_LOCK = threading.RLock()
+
+    _GRAMMAR_GLUE = {
+        "i": "tôi", "you": "bạn", "he": "anh ấy", "she": "cô ấy", "it": "nó",
+        "we": "chúng ta", "they": "họ", "me": "tôi", "him": "anh ấy", "her": "cô ấy",
+        "us": "chúng tôi", "them": "họ", "my": "của tôi", "your": "của bạn",
+        "his": "của anh ấy", "our": "của chúng ta", "their": "của họ",
+        "this": "này", "that": "đó", "these": "những thứ này", "those": "những thứ đó",
+        "is": "là", "are": "là", "was": "đã là", "were": "đã là", "be": "là",
+        "have": "có", "has": "có", "had": "đã có", "do": "làm", "does": "làm", "did": "đã làm",
+        "can": "có thể", "cannot": "không thể", "can't": "không thể", "could": "có thể",
+        "will": "sẽ", "would": "sẽ", "shall": "sẽ", "should": "nên",
+        "must": "phải", "may": "có lẽ", "might": "có thể",
+        "not": "không", "no": "không", "yes": "có", "never": "không bao giờ",
+        "always": "luôn luôn", "already": "đã", "still": "vẫn", "just": "vừa mới",
+        "in": "trong", "on": "trên", "at": "tại", "to": "đến", "from": "từ",
+        "with": "với", "without": "không có", "for": "cho", "of": "của", "by": "bởi",
+        "about": "về", "into": "vào trong", "through": "xuyên qua", "after": "sau khi",
+        "before": "trước khi", "between": "giữa", "under": "dưới", "over": "trên",
+        "and": "và", "or": "hoặc", "but": "nhưng", "if": "nếu", "because": "vì",
+        "when": "khi", "where": "nơi", "who": "người mà", "what": "gì", "how": "như thế nào",
+        "all": "tất cả", "some": "một vài", "many": "nhiều", "more": "thêm", "most": "nhất",
+        "other": "khác", "new": "mới", "old": "cũ", "good": "tốt", "great": "tuyệt vời",
+        "the": "", "a": "một", "an": "một"
+    }
+
+    def __init__(
+        self,
+        codex_path=CODEX_FILE,
+        cache_path=CACHE_FILE,
+        offline_dict_path=OFFLINE_DICT_FILE,
+        max_cache_size=5000
+    ):
         self.codex_path = codex_path
         self.cache_path = cache_path
+        self.offline_dict_path = offline_dict_path
         self.max_cache_size = max_cache_size
         self.lock = threading.RLock()
 
@@ -209,6 +247,217 @@ class TranslationKnowledgeManager:
         self.recent_dialogue = []  # list of (source_line, translated_line)
 
         self.load()
+
+    @classmethod
+    def ensure_offline_dict_loaded(cls, dict_path=OFFLINE_DICT_FILE):
+        with cls._SHARED_LOCK:
+            if cls._SHARED_OFFLINE_WORDS is not None:
+                return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+            if os.path.exists(dict_path):
+                try:
+                    with open(dict_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    cls._SHARED_OFFLINE_WORDS = data.get("words", {})
+                    cls._SHARED_OFFLINE_PHRASES = data.get("phrases", {})
+                    cls._SHARED_OFFLINE_META = data.get("meta", {})
+                    return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+                except Exception as e:
+                    print(f"Offline dictionary load warning: {e}")
+            cls._SHARED_OFFLINE_WORDS = {}
+            cls._SHARED_OFFLINE_PHRASES = {}
+            cls._SHARED_OFFLINE_META = {"word_count": 0, "phrase_count": 0, "total_entries": 0}
+            return cls._SHARED_OFFLINE_WORDS, cls._SHARED_OFFLINE_PHRASES, cls._SHARED_OFFLINE_META
+
+    def get_offline_dict_total_count(self) -> int:
+        _, _, meta = self.ensure_offline_dict_loaded(self.offline_dict_path)
+        return int(meta.get("total_entries", 0))
+
+    @staticmethod
+    def _clean_concise_meaning(raw_meaning: str) -> str:
+        if not raw_meaning:
+            return ""
+        first_seg = raw_meaning.split(";")[0].strip()
+        if first_seg.startswith("bộm "):
+            first_seg = first_seg[4:].strip()
+        # Strip leading parenthetical domain tags like "(vật lí) " or "(từ Mỹ,nghĩa Mỹ) "
+        while first_seg.startswith("(") and ")" in first_seg:
+            after = first_seg.split(")", 1)[1].strip()
+            if after:
+                first_seg = after
+            else:
+                break
+        # Take first 2 comma-separated synonyms for compact HUD display
+        parts = [p.strip() for p in first_seg.split(",") if p.strip()]
+        if len(parts) > 2:
+            return ", ".join(parts[:2])
+        return first_seg
+
+    @classmethod
+    def _stem_english_word(cls, w_lower: str, words_dict: dict):
+        if w_lower in words_dict:
+            return w_lower, words_dict[w_lower]
+        if len(w_lower) <= 3:
+            return None, None
+
+        candidates = []
+        if w_lower.endswith("ies") and len(w_lower) > 4:
+            candidates.append(w_lower[:-3] + "y")
+        if w_lower.endswith("ves") and len(w_lower) > 4:
+            candidates.append(w_lower[:-3] + "f")
+            candidates.append(w_lower[:-3] + "fe")
+        if w_lower.endswith("es") and len(w_lower) > 3:
+            candidates.append(w_lower[:-2])
+            candidates.append(w_lower[:-1])
+        if w_lower.endswith("s") and not w_lower.endswith("ss"):
+            candidates.append(w_lower[:-1])
+        if w_lower.endswith("ied") and len(w_lower) > 4:
+            candidates.append(w_lower[:-3] + "y")
+        if w_lower.endswith("ed") and len(w_lower) > 4:
+            base = w_lower[:-2]
+            candidates.extend([base, base + "e"])
+            if len(base) >= 3 and base[-1] == base[-2]:
+                candidates.append(base[:-1])
+        if w_lower.endswith("ing") and len(w_lower) > 5:
+            base = w_lower[:-3]
+            candidates.extend([base, base + "e"])
+            if len(base) >= 3 and base[-1] == base[-2]:
+                candidates.append(base[:-1])
+        if w_lower.endswith("ly") and len(w_lower) > 4:
+            candidates.append(w_lower[:-2])
+        if w_lower.endswith("er") and len(w_lower) > 4:
+            candidates.extend([w_lower[:-2], w_lower[:-1]])
+        if w_lower.endswith("est") and len(w_lower) > 5:
+            candidates.extend([w_lower[:-3], w_lower[:-2]])
+
+        for cand in candidates:
+            if cand in words_dict:
+                return cand, words_dict[cand]
+        return None, None
+
+    def lookup_offline_en_vi(self, text: str):
+        """
+        Look up a word or phrase in the 133,675-entry offline English-Vietnamese dictionary.
+        Returns dict {"source": str, "concise": str, "full": str, "phonetic": str, "pos": str} or None.
+        """
+        cleaned = text.strip().strip(".,!?:;\"'()[]{}<>-—")
+        if not cleaned:
+            return None
+        key = " ".join(cleaned.lower().split())
+        words_dict, phrases_dict, _ = self.ensure_offline_dict_loaded(self.offline_dict_path)
+
+        if key in phrases_dict:
+            full_m = phrases_dict[key]
+            return {
+                "source": key,
+                "concise": self._clean_concise_meaning(full_m),
+                "full": full_m,
+                "phonetic": "",
+                "pos": "cụm từ / thành ngữ"
+            }
+
+        matched_word, record = self._stem_english_word(key, words_dict)
+        if record:
+            full_m = record[0] if len(record) > 0 else ""
+            pron = record[1] if len(record) > 1 else ""
+            pos = record[2] if len(record) > 2 else ""
+            return {
+                "source": matched_word,
+                "concise": self._clean_concise_meaning(full_m),
+                "full": full_m,
+                "phonetic": pron,
+                "pos": pos
+            }
+        return None
+
+    def translate_sentence_offline(self, text: str) -> str:
+        """
+        100% Offline English-to-Vietnamese sentence translator using Longest-Phrase Matching (up to 5-gram)
+        across Game Codex + 30,560 Offline Phrases + 103,115 Offline Words (with stemming).
+        """
+        if not text or not text.strip():
+            return text
+        words_dict, phrases_dict, _ = self.ensure_offline_dict_loaded(self.offline_dict_path)
+        with self.lock:
+            codex_map = {e["source"].strip().lower(): e["target"] for e in self.codex_entries if e.get("source")}
+
+        raw_tokens = text.strip().split()
+        if not raw_tokens:
+            return text
+
+        out_tokens = []
+        i = 0
+        n = len(raw_tokens)
+
+        while i < n:
+            matched_phrase = False
+            # Try n-gram phrases from 5 words down to 2 words
+            max_span = min(5, n - i)
+            for span in range(max_span, 1, -1):
+                chunk_tokens = raw_tokens[i: i + span]
+                lead_punct = ""
+                trail_punct = ""
+                while chunk_tokens[0] and chunk_tokens[0][0] in "([\"'":
+                    lead_punct += chunk_tokens[0][0]
+                    chunk_tokens[0] = chunk_tokens[0][1:]
+                while chunk_tokens[-1] and chunk_tokens[-1][-1] in ".,!?:;)]\"'":
+                    trail_punct = chunk_tokens[-1][-1] + trail_punct
+                    chunk_tokens[-1] = chunk_tokens[-1][:-1]
+
+                phrase_key = " ".join(chunk_tokens).lower().strip()
+                if not phrase_key:
+                    continue
+                if phrase_key in codex_map:
+                    out_tokens.append(f"{lead_punct}{codex_map[phrase_key]}{trail_punct}")
+                    i += span
+                    matched_phrase = True
+                    break
+                if phrase_key in phrases_dict:
+                    concise = self._clean_concise_meaning(phrases_dict[phrase_key])
+                    out_tokens.append(f"{lead_punct}{concise}{trail_punct}")
+                    i += span
+                    matched_phrase = True
+                    break
+                if f"to {phrase_key}" in phrases_dict:
+                    concise = self._clean_concise_meaning(phrases_dict[f"to {phrase_key}"])
+                    out_tokens.append(f"{lead_punct}{concise}{trail_punct}")
+                    i += span
+                    matched_phrase = True
+                    break
+
+            if matched_phrase:
+                continue
+
+            # Single token translation
+            tok = raw_tokens[i]
+            lead_p = ""
+            trail_p = ""
+            core = tok
+            while core and core[0] in "([\"'":
+                lead_p += core[0]
+                core = core[1:]
+            while core and core[-1] in ".,!?:;)]\"'":
+                trail_p = core[-1] + trail_p
+                core = core[:-1]
+
+            core_lower = core.lower()
+            if not core_lower:
+                out_tokens.append(tok)
+            elif core_lower in codex_map:
+                out_tokens.append(f"{lead_p}{codex_map[core_lower]}{trail_p}")
+            elif core_lower in self._GRAMMAR_GLUE:
+                glue_vi = self._GRAMMAR_GLUE[core_lower]
+                if glue_vi or trail_p:
+                    out_tokens.append(f"{lead_p}{glue_vi}{trail_p}".strip())
+            else:
+                _, rec = self._stem_english_word(core_lower, words_dict)
+                if rec:
+                    meaning_1 = self._clean_concise_meaning(rec[0]).split(",")[0].strip()
+                    out_tokens.append(f"{lead_p}{meaning_1}{trail_p}")
+                else:
+                    out_tokens.append(tok)
+            i += 1
+
+        return " ".join([t for t in out_tokens if t])
 
     @staticmethod
     def normalize_key(text: str) -> str:
@@ -328,18 +577,72 @@ class TranslationKnowledgeManager:
                 print(f"Import Names.txt warning: {e}")
         return count
 
-    def search_codex(self, query: str = "") -> list:
+    def search_codex(self, query: str = "", max_offline_results: int = 80) -> list:
         q = query.strip().lower()
         with self.lock:
             if not q:
                 return list(self.codex_entries)
-            return [
+            results = [
                 e for e in self.codex_entries
                 if q in e["source"].lower()
                 or q in e["target"].lower()
                 or q in e.get("category", "").lower()
                 or q in e.get("note", "").lower()
             ]
+            seen_sources = {e["source"].lower() for e in results}
+
+        # Also search the 133,675-entry Offline English-Vietnamese Dictionary when user types a query
+        words_dict, phrases_dict, _ = self.ensure_offline_dict_loaded(self.offline_dict_path)
+        offline_matches = []
+
+        # 1. Exact word or phrase match first
+        if q in words_dict and q not in seen_sources:
+            rec = words_dict[q]
+            offline_matches.append({
+                "source": q,
+                "target": self._clean_concise_meaning(rec[0]),
+                "category": f"📖 Từ điển 133K ({rec[2] or 'từ vựng'})",
+                "note": f"{rec[1]} • {rec[0]}".strip(" •")
+            })
+            seen_sources.add(q)
+
+        if q in phrases_dict and q not in seen_sources:
+            full_m = phrases_dict[q]
+            offline_matches.append({
+                "source": q,
+                "target": self._clean_concise_meaning(full_m),
+                "category": "📖 Từ điển 133K (cụm từ)",
+                "note": full_m
+            })
+            seen_sources.add(q)
+
+        # 2. Prefix / substring matches in 133K dictionary (capped for instant UI rendering)
+        if len(q) >= 2:
+            for w, rec in words_dict.items():
+                if len(offline_matches) >= max_offline_results:
+                    break
+                if w not in seen_sources and (w.startswith(q) or q in rec[0].lower()):
+                    offline_matches.append({
+                        "source": w,
+                        "target": self._clean_concise_meaning(rec[0]),
+                        "category": f"📖 Từ điển 133K ({rec[2] or 'từ vựng'})",
+                        "note": f"{rec[1]} • {rec[0]}".strip(" •")
+                    })
+                    seen_sources.add(w)
+
+            for p, full_m in phrases_dict.items():
+                if len(offline_matches) >= max_offline_results:
+                    break
+                if p not in seen_sources and (p.startswith(q) or q in p):
+                    offline_matches.append({
+                        "source": p,
+                        "target": self._clean_concise_meaning(full_m),
+                        "category": "📖 Từ điển 133K (cụm từ)",
+                        "note": full_m
+                    })
+                    seen_sources.add(p)
+
+        return results + offline_matches
 
     def find_relevant_codex_entries(self, text_lines: list) -> list:
         joined_lower = "\n".join(text_lines).lower()
@@ -418,6 +721,17 @@ class TranslationKnowledgeManager:
                     best_record["hits"] = best_record.get("hits", 1) + 1
                     best_record["updated_at"] = time.time()
                     return best_record["target"]
+
+            # 4. Direct match in 133,675-entry Offline English-Vietnamese Dictionary for single words or known idioms
+            if target_lang.lower().startswith("viet"):
+                words_dict, phrases_dict, _ = self.ensure_offline_dict_loaded(self.offline_dict_path)
+                clean_q = norm_lower.strip(".,!?:;\"'()[]{}<>")
+                if clean_q in phrases_dict:
+                    return self._clean_concise_meaning(phrases_dict[clean_q])
+                if " " not in clean_q and clean_q.isalpha():
+                    _, rec = self._stem_english_word(clean_q, words_dict)
+                    if rec and rec[0]:
+                        return self._clean_concise_meaning(rec[0])
 
         return None
 
@@ -687,6 +1001,9 @@ class TranslationWorker(QThread):
         return "\n\n".join(parts)
 
     def translate_batch_with_context(self, text_lines):
+        if self.api_key and self.api_key.strip().lower() == "offline" and self.knowledge_mgr:
+            return [self.knowledge_mgr.translate_sentence_offline(line) for line in text_lines]
+
         if self.api_key:
             try:
                 headers = {
@@ -743,6 +1060,8 @@ class TranslationWorker(QThread):
                 return split_lines
             return full_translated.split("\n")
         except Exception:
+            if self.knowledge_mgr and self.target_lang.lower().startswith("viet"):
+                return [self.knowledge_mgr.translate_sentence_offline(line) for line in text_lines]
             return text_lines
 
 
@@ -1197,7 +1516,7 @@ class CodexAndCacheDialog(QDialog):
         self.txt_codex_search = QLineEdit()
         self.txt_codex_search.setFixedHeight(34)
         self.txt_codex_search.setPlaceholderText(
-            "🔍 Tra cứu nhanh tên nhân vật, chiêu thức, vật phẩm, địa danh hoặc cốt truyện..."
+            "🔍 Gõ từ tiếng Anh/Trung/Nhật/Hàn bất kỳ để tra cứu trong Bách Khoa + 133,675 từ/cụm từ Anh-Việt Offline..."
         )
         self.txt_codex_search.textChanged.connect(self.refresh_codex_table)
         row_search_codex.addWidget(self.txt_codex_search, 1)
@@ -1213,6 +1532,9 @@ class CodexAndCacheDialog(QDialog):
         btn_import.clicked.connect(self.import_glossary_dialog)
         row_search_codex.addWidget(btn_import)
         l_codex.addLayout(row_search_codex)
+
+        self.lbl_codex_stats = QLabel("")
+        l_codex.addWidget(self.lbl_codex_stats)
 
         self.tbl_codex = QTableWidget(0, 4)
         self.tbl_codex.setHorizontalHeaderLabels([
@@ -1346,7 +1668,18 @@ class CodexAndCacheDialog(QDialog):
         self.knowledge_mgr.save_codex()
 
     def refresh_codex_table(self):
-        entries = self.knowledge_mgr.search_codex(self.txt_codex_search.text())
+        q = self.txt_codex_search.text()
+        entries = self.knowledge_mgr.search_codex(q)
+        offline_total = self.knowledge_mgr.get_offline_dict_total_count()
+        codex_total = len(self.knowledge_mgr.codex_entries)
+        if q.strip():
+            self.lbl_codex_stats.setText(
+                f"🔎 Tìm thấy {len(entries)} kết quả (trên tổng số {codex_total} mục Bách Khoa Game + {offline_total:,} mục Đại Từ Điển Anh-Việt Offline)"
+            )
+        else:
+            self.lbl_codex_stats.setText(
+                f"✅ Đã nạp sẵn: {codex_total} mục Bách Khoa Game • {offline_total:,} mục Đại Từ Điển Anh-Việt Offline (Gõ vào ô tìm kiếm để tra cứu toàn bộ 133,675 từ/cụm từ)"
+            )
         self.tbl_codex.setRowCount(len(entries))
         for r, item in enumerate(entries):
             self.tbl_codex.setItem(r, 0, QTableWidgetItem(item.get("source", "")))
