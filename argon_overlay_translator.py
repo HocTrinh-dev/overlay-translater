@@ -1202,7 +1202,13 @@ class CodexAndCacheDialog(QDialog):
         self.txt_codex_search.textChanged.connect(self.refresh_codex_table)
         row_search_codex.addWidget(self.txt_codex_search, 1)
 
-        btn_import = QPushButton("📂 Nhập Names.txt / Glossary")
+        btn_preset = QPushButton("⚡ Nạp Bách Khoa Mẫu")
+        btn_preset.setObjectName("ActionBtn")
+        btn_preset.setToolTip("Nạp ngay bộ Bách Khoa Toàn Thư Game & Chat Đa Ngôn Ngữ (Names.txt)")
+        btn_preset.clicked.connect(self.load_builtin_preset_glossary)
+        row_search_codex.addWidget(btn_preset)
+
+        btn_import = QPushButton("📂 Nhập File .txt Khác")
         btn_import.setObjectName("SubBtn")
         btn_import.clicked.connect(self.import_glossary_dialog)
         row_search_codex.addWidget(btn_import)
@@ -1382,6 +1388,24 @@ class CodexAndCacheDialog(QDialog):
         self.knowledge_mgr.delete_codex(src)
         self.refresh_codex_table()
         self.knowledge_updated.emit()
+
+    def load_builtin_preset_glossary(self):
+        preset_path = os.path.join(APP_DIR, "Names.txt")
+        if not os.path.exists(preset_path):
+            QMessageBox.warning(
+                self,
+                "Không tìm thấy Names.txt",
+                f"Không tìm thấy file từ điển mẫu tại:\n{preset_path}"
+            )
+            return
+        imported = self.knowledge_mgr.import_names_file(preset_path, save_after=True)
+        self.refresh_codex_table()
+        self.knowledge_updated.emit()
+        QMessageBox.information(
+            self,
+            "Nạp Bách Khoa Toàn Thư Mẫu",
+            f"Đã nạp thành công {imported} mục từ điển Bách Khoa Game & Khung Chat Đa Ngôn Ngữ!"
+        )
 
     def import_glossary_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
