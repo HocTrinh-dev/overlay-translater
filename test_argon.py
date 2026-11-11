@@ -431,7 +431,34 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             self.assertEqual(studio.overlay_hud.overlay_style, expected_style)
             studio.overlay_hud.repaint()
 
+        # Verify live typography and appearance settings (font size, font family, color, opacity, bold, auto-fit)
+        studio.cb_font_family.setCurrentText("Tahoma")
+        studio.sp_font_size.setValue(20)
+        studio.cb_text_color.setCurrentIndex(2)  # Vàng kim (#FACC15)
+        studio.sp_bg_opacity.setValue(75)
+        studio.chk_font_bold.setChecked(False)
+        studio.chk_auto_font.setChecked(False)
+
+        self.assertEqual(studio.overlay_hud.font_family, "Tahoma")
+        self.assertEqual(studio.overlay_hud.font_size, 20)
+        self.assertEqual(studio.overlay_hud.text_color_mode, "#FACC15")
+        self.assertEqual(studio.overlay_hud.bg_opacity, 75)
+        self.assertFalse(studio.overlay_hud.font_bold)
+        self.assertFalse(studio.overlay_hud.auto_font_fit)
+
+        studio.save_config()
         studio.close()
+
+        # Reload in a new window and verify persistence
+        studio2 = aot.MainStudioWindow(config_path=self.config_path)
+        self.assertEqual(studio2.overlay_hud.font_family, "Tahoma")
+        self.assertEqual(studio2.overlay_hud.font_size, 20)
+        self.assertEqual(studio2.overlay_hud.text_color_mode, "#FACC15")
+        self.assertEqual(studio2.overlay_hud.bg_opacity, 75)
+        self.assertFalse(studio2.overlay_hud.font_bold)
+        self.assertFalse(studio2.overlay_hud.auto_font_fit)
+        studio2.close()
+
 
     def test_auto_install_tesseract_fallback_on_new_machine(self):
         """Verify TranslationWorker automatically triggers ensure_tesseract_installed and retries OCR on a new machine."""

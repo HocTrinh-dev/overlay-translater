@@ -1524,6 +1524,12 @@ class FloatingOverlayHUD(QWidget):
         self.drag_offset = None
         self.dpr = 1.0
         self.overlay_style = "replace"  # "replace" (In-Place Chameleon), "transparent" (Halo Text Only), "glass" (Translucent Pill)
+        self.font_family = "Segoe UI"
+        self.font_size = 13
+        self.font_bold = True
+        self.auto_font_fit = True
+        self.text_color_mode = "auto"  # "auto" or hex color string e.g. "#FFFFFF", "#FACC15"
+        self.bg_opacity = 95           # 0..100 (%)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -1555,6 +1561,30 @@ class FloatingOverlayHUD(QWidget):
             painter.drawText(rect.adjusted(dx, dy, dx, dy), flags, text)
         painter.setPen(fg_color)
         painter.drawText(rect, flags, text)
+
+    def _resolve_colors_for_block(self, bg_rgb: tuple, fg_rgb: tuple, default_mode: str) -> tuple:
+        """Return (fg_qcolor, outline_qcolor) respecting user's custom text_color_mode or automatic contrast."""
+        if self.text_color_mode and self.text_color_mode != "auto" and self.text_color_mode.startswith("#"):
+            custom_fg = QColor(self.text_color_mode)
+            lum = 0.299 * custom_fg.red() + 0.587 * custom_fg.green() + 0.114 * custom_fg.blue()
+            if lum > 130:
+                outline_c = QColor(9, 13, 22, 245)
+            else:
+                outline_c = QColor(248, 250, 252, 245)
+            return custom_fg, outline_c
+
+        if default_mode == "replace":
+            return (
+                QColor(fg_rgb[0], fg_rgb[1], fg_rgb[2], 255),
+                QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 245)
+            )
+        if default_mode == "transparent":
+            bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+            if bg_lum < 145:
+                return QColor(254, 249, 195, 255), QColor(9, 13, 22, 245)
+            return QColor(15, 23, 42, 255), QColor(248, 250, 252, 245)
+
+        return QColor(248, 250, 252, 255), QColor(11, 15, 25, 230)
 
     def paintEvent(self, event):
         if self.is_capturing:
@@ -1595,6 +1625,10 @@ class FloatingOverlayHUD(QWidget):
             painter.setPen(QPen(QColor(129, 140, 248, 220), 2, Qt.SolidLine, Qt.RoundCap))
             painter.drawPath(grip_path)
 
+        weight = QFont.Bold if self.font_bold else QFont.Normal
+        base_pt = max(6, min(48, int(self.font_size)))
+        mask_alpha = max(0, min(255, int(self.bg_opacity * 255 / 100)))
+
         for b in self.blocks:
             rx, ry, rw, rh = b['rect']
             lx = int(rx / self.dpr)
@@ -1606,48 +1640,50 @@ class FloatingOverlayHUD(QWidget):
             bg_rgb = b.get('bg_color', (15, 23, 42))
             fg_rgb = b.get('fg_color', (248, 250, 252))
 
-            # Auto-fit font size so translated text fits cleanly over the original text position
-            target_font_size = max(9, min(18, int(orig_lh * 0.60)))
-            max_avail_w = max(orig_lw + 60, min(orig_lw + 140, w - lx - 4))
-            font = QFont("Segoe UI", target_font_size, QFont.Bold)
+            target_font_size = base_pt
+            max_avail_w = max(orig_lw + 60, min(orig_lw + 160, w - lx - 4))
+            font = QFont(self.font_family, target_font_size, weight)
             fm = QFontMetrics(font)
-            while target_font_size > 8 and fm.horizontalAdvance(text) > max_avail_w * 1.35:
-                target_font_size -= 1
-                font = QFont("Segoe UI", target_font_size, QFont.Bold)
-                fm = QFontMetrics(font)
+
+            if self.auto_font_fit:
+                min_shrink_pt = max(7, base_pt - 5)
+                while target_font_size > min_shrink_pt and fm.horizontalAdvance(text) > max_avail_w * 1.35:
+                    target_font_size -= 1
+                    font = QFont(self.font_family, target_font_size, weight)
+                    fm = QFontMetrics(font)
 
             painter.setFont(font)
             text_rect = fm.boundingRect(
-                QRect(lx, ly, max_avail_w, orig_lh + 24),
+                QRect(lx, ly, max_avail_w, max(orig_lh + 36, target_font_size * 4)),
                 Qt.TextWordWrap,
                 text
             )
-            draw_w = max(orig_lw, min(text_rect.width() + 10, w - lx - 2))
+            draw_w = max(orig_lw, min(text_rect.width() + 12, w - lx - 2))
             draw_h = max(orig_lh, text_rect.height() + 4)
 
             if self.overlay_style == "replace":
                 # 1. Erase original foreign text on image using chameleon sampled background color (zero border)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 248)))
-                painter.drawRoundedRect(QRectF(lx - 2, ly - 1, orig_lw + 4, orig_lh + 2), 3, 3)
+                if mask_alpha > 0:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], mask_alpha)))
+                    painter.drawRoundedRect(QRectF(lx - 2, ly - 1, orig_lw + 4, orig_lh + 2), 3, 3)
 
-                for wm in b.get('word_masks', []):
-                    wx, wy, ww, wh = wm['rect']
-                    w_bg = wm.get('bg_color', bg_rgb)
-                    painter.setBrush(QBrush(QColor(w_bg[0], w_bg[1], w_bg[2], 252)))
-                    painter.drawRoundedRect(
-                        QRectF(
-                            int(wx / self.dpr) - 2,
-                            int(wy / self.dpr) - 1,
-                            max(4, int(ww / self.dpr) + 4),
-                            max(4, int(wh / self.dpr) + 2)
-                        ),
-                        2, 2
-                    )
+                    for wm in b.get('word_masks', []):
+                        wx, wy, ww, wh = wm['rect']
+                        w_bg = wm.get('bg_color', bg_rgb)
+                        painter.setBrush(QBrush(QColor(w_bg[0], w_bg[1], w_bg[2], mask_alpha)))
+                        painter.drawRoundedRect(
+                            QRectF(
+                                int(wx / self.dpr) - 2,
+                                int(wy / self.dpr) - 1,
+                                max(4, int(ww / self.dpr) + 4),
+                                max(4, int(wh / self.dpr) + 2)
+                            ),
+                            2, 2
+                        )
 
                 # 2. Draw translated text directly in-place on transparent background with chameleon outline
-                fg_qcolor = QColor(fg_rgb[0], fg_rgb[1], fg_rgb[2], 255)
-                outline_qcolor = QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], 245)
+                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "replace")
                 self._draw_outlined_text(
                     painter,
                     QRectF(lx, ly - 1, draw_w, draw_h + 2),
@@ -1659,13 +1695,7 @@ class FloatingOverlayHUD(QWidget):
 
             elif self.overlay_style == "transparent":
                 # 100% Transparent background (no fill), crisp halo-outlined text
-                bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
-                if bg_lum < 145:
-                    fg_qcolor = QColor(254, 249, 195, 255)
-                    outline_qcolor = QColor(9, 13, 22, 245)
-                else:
-                    fg_qcolor = QColor(15, 23, 42, 255)
-                    outline_qcolor = QColor(248, 250, 252, 245)
+                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "transparent")
                 self._draw_outlined_text(
                     painter,
                     QRectF(lx, ly - 1, draw_w, draw_h + 2),
@@ -1678,17 +1708,20 @@ class FloatingOverlayHUD(QWidget):
             else:
                 # Semi-transparent glass pill
                 bg_rect = QRectF(lx - 3, ly - 1, draw_w + 6, draw_h + 2)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(11, 15, 25, 135)))
-                painter.drawRoundedRect(bg_rect, 4, 4)
+                if mask_alpha > 0:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(QColor(11, 15, 25, mask_alpha)))
+                    painter.drawRoundedRect(bg_rect, 4, 4)
+                fg_qcolor, outline_qcolor = self._resolve_colors_for_block(bg_rgb, fg_rgb, "glass")
                 self._draw_outlined_text(
                     painter,
                     QRectF(lx, ly - 1, draw_w, draw_h + 2),
                     Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
                     text,
-                    QColor(248, 250, 252, 255),
-                    QColor(11, 15, 25, 230)
+                    fg_qcolor,
+                    outline_qcolor
                 )
+
 
     def mousePressEvent(self, event):
         if self.is_locked or self.is_fullscreen:
@@ -2534,6 +2567,101 @@ class MainStudioWindow(QWidget):
         col_style.addWidget(self.cb_overlay_style)
         c1_layout.addLayout(col_style)
 
+        # Typography & Appearance Suite (Font Family, Font Size, Text Color, Background Opacity, Bold, Auto-fit)
+        row_typo1 = QHBoxLayout()
+        row_typo1.setSpacing(10)
+
+        col_ff = QVBoxLayout()
+        col_ff.setSpacing(6)
+        lbl_ff = QLabel("Phông chữ (Font):")
+        lbl_ff.setObjectName("FieldLabel")
+        self.cb_font_family = QComboBox()
+        self.cb_font_family.setView(QListView())
+        self.cb_font_family.setFixedHeight(36)
+        self.cb_font_family.addItems([
+            "Segoe UI",
+            "Tahoma",
+            "Arial",
+            "Times New Roman",
+            "Verdana",
+            "Consolas"
+        ])
+        self.cb_font_family.currentTextChanged.connect(self.on_typography_changed)
+        col_ff.addWidget(lbl_ff)
+        col_ff.addWidget(self.cb_font_family)
+
+        col_fs = QVBoxLayout()
+        col_fs.setSpacing(6)
+        lbl_fs = QLabel("Cỡ chữ (Size):")
+        lbl_fs.setObjectName("FieldLabel")
+        self.sp_font_size = QSpinBox()
+        self.sp_font_size.setFixedHeight(36)
+        self.sp_font_size.setMinimumWidth(85)
+        self.sp_font_size.setRange(6, 48)
+        self.sp_font_size.setValue(13)
+        self.sp_font_size.setSuffix(" pt")
+        self.sp_font_size.setToolTip("Điều chỉnh cỡ chữ tiếng Việt hiển thị trên hình (6 pt - 48 pt)")
+        self.sp_font_size.valueChanged.connect(self.on_typography_changed)
+        col_fs.addWidget(lbl_fs)
+        col_fs.addWidget(self.sp_font_size)
+
+        col_tc = QVBoxLayout()
+        col_tc.setSpacing(6)
+        lbl_tc = QLabel("Màu chữ (Color):")
+        lbl_tc.setObjectName("FieldLabel")
+        self.cb_text_color = QComboBox()
+        self.cb_text_color.setView(QListView())
+        self.cb_text_color.setFixedHeight(36)
+        self.cb_text_color.addItems([
+            "🎨 Tự động (Auto)",
+            "⚪ Trắng (#FFFFFF)",
+            "🟡 Vàng kim (#FACC15)",
+            "🟢 Xanh lá (#4ADE80)",
+            "🔵 Xanh băng (#38BDF8)",
+            "🌸 Hồng đào (#FB7185)",
+            "⚫ Đen đậm (#0F172A)"
+        ])
+        self.cb_text_color.currentIndexChanged.connect(self.on_typography_changed)
+        col_tc.addWidget(lbl_tc)
+        col_tc.addWidget(self.cb_text_color)
+
+        row_typo1.addLayout(col_ff, 2)
+        row_typo1.addLayout(col_fs, 1)
+        row_typo1.addLayout(col_tc, 2)
+        c1_layout.addLayout(row_typo1)
+
+        row_typo2 = QHBoxLayout()
+        row_typo2.setSpacing(12)
+
+        lbl_op = QLabel("Độ đục nền:")
+        lbl_op.setObjectName("FieldLabel")
+        self.sp_bg_opacity = QSpinBox()
+        self.sp_bg_opacity.setFixedHeight(36)
+        self.sp_bg_opacity.setMinimumWidth(85)
+        self.sp_bg_opacity.setRange(0, 100)
+        self.sp_bg_opacity.setSingleStep(5)
+        self.sp_bg_opacity.setValue(95)
+        self.sp_bg_opacity.setSuffix("%")
+        self.sp_bg_opacity.setToolTip("Độ đục của lớp nền xóa chữ gốc / khung kính mờ (0% = trong suốt hoàn toàn, 100% = che kín)")
+        self.sp_bg_opacity.valueChanged.connect(self.on_typography_changed)
+
+        self.chk_font_bold = QCheckBox("Chữ đậm (Bold)")
+        self.chk_font_bold.setChecked(True)
+        self.chk_font_bold.stateChanged.connect(self.on_typography_changed)
+
+        self.chk_auto_font = QCheckBox("Tự thu nhỏ câu dài")
+        self.chk_auto_font.setChecked(True)
+        self.chk_auto_font.setToolTip("Tự động giảm nhẹ cỡ chữ nếu câu dịch quá dài so với khung chữ gốc")
+        self.chk_auto_font.stateChanged.connect(self.on_typography_changed)
+
+        row_typo2.addWidget(lbl_op)
+        row_typo2.addWidget(self.sp_bg_opacity)
+        row_typo2.addSpacing(6)
+        row_typo2.addWidget(self.chk_font_bold)
+        row_typo2.addWidget(self.chk_auto_font)
+        row_typo2.addStretch()
+        c1_layout.addLayout(row_typo2)
+
         row_auto = QHBoxLayout()
         self.chk_auto = QCheckBox("Auto-scan && translate every:")
         self.chk_auto.stateChanged.connect(self.toggle_auto_timer)
@@ -2660,6 +2788,21 @@ class MainStudioWindow(QWidget):
         self.overlay_hud.overlay_style = style_map.get(index, "replace")
         self.overlay_hud.update()
 
+    @staticmethod
+    def _extract_color_mode_from_text(label_text: str) -> str:
+        if "#" in label_text and ")" in label_text:
+            return "#" + label_text.split("#", 1)[1].split(")", 1)[0].strip()
+        return "auto"
+
+    def on_typography_changed(self, *args):
+        self.overlay_hud.font_family = self.cb_font_family.currentText().strip() or "Segoe UI"
+        self.overlay_hud.font_size = self.sp_font_size.value()
+        self.overlay_hud.text_color_mode = self._extract_color_mode_from_text(self.cb_text_color.currentText())
+        self.overlay_hud.bg_opacity = self.sp_bg_opacity.value()
+        self.overlay_hud.font_bold = self.chk_font_bold.isChecked()
+        self.overlay_hud.auto_font_fit = self.chk_auto_font.isChecked()
+        self.overlay_hud.update()
+
     def on_capture_mode_changed(self, index: int):
         self.clear_overlay_text()
         if index == 1:
@@ -2761,6 +2904,35 @@ class MainStudioWindow(QWidget):
             style_idx_map = {"replace": 0, "transparent": 1, "glass": 2}
             self.cb_overlay_style.setCurrentIndex(style_idx_map.get(overlay_style, 0))
 
+            if "font_family" in cfg and isinstance(cfg["font_family"], str):
+                idx = self.cb_font_family.findText(cfg["font_family"])
+                if idx >= 0:
+                    self.cb_font_family.setCurrentIndex(idx)
+
+            if "font_size" in cfg and isinstance(cfg["font_size"], int):
+                self.sp_font_size.setValue(max(6, min(48, cfg["font_size"])))
+
+            if "text_color_mode" in cfg and isinstance(cfg["text_color_mode"], str):
+                tc_val = cfg["text_color_mode"]
+                if tc_val == "auto":
+                    self.cb_text_color.setCurrentIndex(0)
+                else:
+                    for i in range(self.cb_text_color.count()):
+                        if tc_val.upper() in self.cb_text_color.itemText(i).upper():
+                            self.cb_text_color.setCurrentIndex(i)
+                            break
+
+            if "bg_opacity" in cfg and isinstance(cfg["bg_opacity"], int):
+                self.sp_bg_opacity.setValue(max(0, min(100, cfg["bg_opacity"])))
+
+            if "font_bold" in cfg and isinstance(cfg["font_bold"], bool):
+                self.chk_font_bold.setChecked(cfg["font_bold"])
+
+            if "auto_font_fit" in cfg and isinstance(cfg["auto_font_fit"], bool):
+                self.chk_auto_font.setChecked(cfg["auto_font_fit"])
+
+            self.on_typography_changed()
+
             if "update_url" in cfg and isinstance(cfg["update_url"], str):
                 self.update_url = normalize_github_raw_url(cfg["update_url"])
             if "auto_update_on_start" in cfg and isinstance(cfg["auto_update_on_start"], bool):
@@ -2782,6 +2954,12 @@ class MainStudioWindow(QWidget):
             "auto_interval": self.sp_interval.value(),
             "capture_mode": "fullscreen" if self.cb_mode.currentIndex() == 1 else "region",
             "overlay_style": style_map.get(self.cb_overlay_style.currentIndex(), "replace"),
+            "font_family": self.cb_font_family.currentText(),
+            "font_size": self.sp_font_size.value(),
+            "text_color_mode": self._extract_color_mode_from_text(self.cb_text_color.currentText()),
+            "bg_opacity": self.sp_bg_opacity.value(),
+            "font_bold": self.chk_font_bold.isChecked(),
+            "auto_font_fit": self.chk_auto_font.isChecked(),
             "overlay_hud": [geo.x(), geo.y(), geo.width(), geo.height()],
             "update_url": self.update_url,
             "auto_update_on_start": self.auto_update_on_start
@@ -2791,6 +2969,7 @@ class MainStudioWindow(QWidget):
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"Configuration save warning: {e}")
+
 
     def prompt_update_url(self) -> bool:
         url, ok = QInputDialog.getText(
