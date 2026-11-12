@@ -217,15 +217,16 @@ def _is_arrow_delimiter_token(text: str) -> bool:
 
 def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) -> list:
     """
-    For game/Minecraft chat lines formatted like `[Rank] PlayerName >> message` (or `»`, `> >`, `>`),
-    discard all tokens before and including `>>` so ONLY the message after `>>` is translated
-    and the overlay bounding box starts right after `>>` (leaving Rank & PlayerName untouched).
+    For game/Minecraft chat lines formatted like `[Rank] PlayerName >> message` (or `»`, `> >`, `>`, `:`, `：`),
+    discard all tokens before and including the delimiter so ONLY the message after `>>` or `:` is translated
+    and the overlay bounding box starts right after the delimiter (leaving Rank & PlayerName untouched).
+    Protects timestamps (`[14:30]`, `12:00`), URLs (`https://...`), numeric ratios (`1:2`), and emoticons (`:)`).
     """
     if not strip_after_arrow or not line_items:
         return line_items
 
     n = len(line_items)
-    # Pass 1: Explicit '>>', '»', '> >', or '>' delimiter token
+    # Pass 1: Explicit '>>', '»', '> >', or '>' delimiter token (highest priority)
     for idx, item in enumerate(line_items):
         tok = item.get("text", "").strip()
         if not tok:
@@ -236,7 +237,7 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
             next_item = line_items[idx + 1]
             next_tok = next_item.get("text", "").strip()
             if (tok.endswith(">") or tok.endswith("›")) and (next_tok.startswith(">") or next_tok.startswith("›")):
-                after_next = next_tok.lstrip(">›=-: ").strip()
+                after_next = next_tok.lstrip(">›=-:： ").strip()
                 if not after_next:
                     return line_items[idx + 2:]
                 nbx, nby, nbw, nbh = next_item["rect"]
@@ -258,7 +259,7 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
                 matched_pos = pos
         if matched_delim is not None:
             end_pos = matched_pos + len(matched_delim)
-            after_str = tok[end_pos:].lstrip(">›=-: ").strip()
+            after_str = tok[end_pos:].lstrip(">›=-:： ").strip()
             if not after_str:
                 return line_items[idx + 1:]
             bx, by, bw, bh = item["rect"]
@@ -277,7 +278,7 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
             if (tok.endswith(">") or tok.endswith("›")) and len(tok) > 1:
                 return line_items[idx + 1:]
             if idx >= 1 and (tok.startswith(">") or tok.startswith("›")):
-                after_str = tok.lstrip(">›=-: ").strip()
+                after_str = tok.lstrip(">›=-:： ").strip()
                 if after_str:
                     bx, by, bw, bh = item["rect"]
                     prefix_chars = len(tok) - len(after_str)
@@ -288,7 +289,76 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
                     }
                     return [adj_item] + line_items[idx + 1:]
 
-    # Pass 2: Wide horizontal gap fallback (when dark-gray '&8>>' was not recognized as a glyph by OCR)
+    # Pass 2: Speaker colon ':' / '：' in prefix area (e.g. `[VIP+] Steve: Hello`, `[14:30] Steve : Hello`, `Name:Hello`)
+    colon_limit = min(6, n)
+    for idx in range(colon_limit):
+        item = line_items[idx]
+        tok = item.get("text", "").strip()
+        if not tok or (":" not in tok and "：" not in tok):
+            continue
+
+        # 2a. Standalone ':' or '：' (skip if splitting numeric time/ratio like '14 : 30')
+        if tok in (":", "："):
+            if 0 < idx < n - 1:
+                prev_clean = line_items[idx - 1].get("text", "").strip().strip("[]() ")
+                next_clean = line_items[idx + 1].get("text", "").strip().strip("[]() ")
+                if prev_clean.isdigit() and next_clean.isdigit():
+                    continue
+            return line_items[idx + 1:]
+
+        # 2b. Scan ':' / '：' positions inside token (protects '[14:30]', '1:2', 'https://...', ':)')
+        for pos, ch in enumerate(tok):
+            if ch not in (":", "："):
+                continue
+            before = tok[:pos]
+            after_raw = tok[pos + 1:]
+
+            if after_raw.startswith("//") or before.lower() in ("http", "https", "ftp"):
+                continue
+
+            if not before:
+                if idx >= 1 and not after_raw.startswith((")", "(", "D", "P", "p", "3", "/", "|", "-")):
+                    after_str = after_raw.lstrip(">›=-:： ").strip()
+                    if not after_str:
+                        return line_items[idx + 1:]
+                    bx, by, bw, bh = item["rect"]
+                    prefix_chars = len(tok) - len(after_str)
+                    shift_x = int(bw * prefix_chars / max(1, len(tok)))
+                    adj_item = {
+                        "rect": (bx + shift_x, by, max(8, bw - shift_x), bh),
+                        "text": after_str,
+                    }
+                    return [adj_item] + line_items[idx + 1:]
+                continue
+
+            b_clean = before.strip("[]()<>")
+            has_alpha = any(c.isalpha() for c in b_clean)
+            if not has_alpha and after_raw and after_raw[0].isdigit():
+                # Timestamp like '[14:30]', '12:00:05' or ratio like '1:2'
+                continue
+            if not has_alpha and not before.endswith(("]", ">", ")")):
+                # Numeric prefix like '14:' followed by '30' (split time) or standalone number before colon
+                if pos == len(tok) - 1 and idx + 1 < n and line_items[idx + 1].get("text", "").strip("[]() ").isdigit():
+                    continue
+                if not after_raw:
+                    continue
+
+            if pos == len(tok) - 1:
+                return line_items[idx + 1:]
+
+            after_str = after_raw.lstrip(">›=-:： ").strip()
+            if not after_str:
+                return line_items[idx + 1:]
+            bx, by, bw, bh = item["rect"]
+            prefix_chars = len(tok) - len(after_str)
+            shift_x = int(bw * prefix_chars / max(1, len(tok)))
+            adj_item = {
+                "rect": (bx + shift_x, by, max(8, bw - shift_x), bh),
+                "text": after_str,
+            }
+            return [adj_item] + line_items[idx + 1:]
+
+    # Pass 3: Wide horizontal gap fallback (when dark-gray '&8>>' / ':' was not recognized as a glyph by OCR)
     if n >= 2:
         avg_h = sum(it["rect"][3] for it in line_items) / n
         min_arrow_gap = max(24, int(avg_h * 1.45))
@@ -304,7 +374,7 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
 
 def filter_ocr_line_items(line_items: list, strip_after_arrow: bool = True) -> list:
     """
-    Strip chat prefix before `>>` (Rank & PlayerName), filter out OCR word items that are purely
+    Strip chat prefix before `>>` or `:` (Rank & PlayerName), filter out OCR word items that are purely
     numbers, special characters, or stat counters, and clean special noise characters from valid tokens.
     """
     working_items = strip_chat_prefix_items(line_items, strip_after_arrow=strip_after_arrow)
@@ -1360,7 +1430,7 @@ class TranslationWorker(QThread):
         for i in range(len(data['text'])):
             word = data['text'][i].strip()
             conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
-            is_delim = any(ch in word for ch in (">", "»", "›", "》", "≫"))
+            is_delim = any(ch in word for ch in (">", "»", "›", "》", "≫", ":", "："))
             if word and (conf > 25 or (is_delim and conf >= 0)):
                 bx, by, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 line_id = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
@@ -3407,10 +3477,10 @@ class MainStudioWindow(QWidget):
             "Tự động xóa ngay chữ dịch cũ trên màn hình khi bạn chuyển Tab, cuộn trang hoặc đổi cửa sổ để không bị rối mắt"
         )
 
-        self.chk_after_arrow = QCheckBox("⏭️ Chỉ dịch sau '>>' (MC)")
+        self.chk_after_arrow = QCheckBox("⏭️ Chỉ dịch sau '>>' / ':' (MC)")
         self.chk_after_arrow.setChecked(True)
         self.chk_after_arrow.setToolTip(
-            "Bỏ qua phần Tên & Rank phía trước dấu '>>' (hoặc '»') trong khung chat Minecraft, chỉ dịch nội dung chat phía sau"
+            "Bỏ qua phần Tên & Rank phía trước dấu '>>', '»' hoặc ':' trong khung chat game/Minecraft (tự giữ nguyên giờ [14:30], URL...), chỉ dịch nội dung chat phía sau"
         )
         self.chk_after_arrow.stateChanged.connect(self._on_translation_settings_changed)
 

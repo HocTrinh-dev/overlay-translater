@@ -852,6 +852,69 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertEqual(emitted[0][0][0]["raw_line"], "Nice sword")
         self.assertEqual(emitted[0][0][0]["text"], "Thanh kiếm đẹp")
 
+        # Colon ':' and fullwidth '：' delimiter cases (preserving leading timestamps, URLs, ratios, emoticons)
+        row_colon = [
+            {"text": "[14:30]", "rect": (10, 68, 42, 16), "bg_color": (0, 0, 0)},
+            {"text": "[VIP+]", "rect": (56, 68, 44, 16), "bg_color": (0, 0, 0)},
+            {"text": "Steve:", "rect": (104, 68, 48, 16), "bg_color": (0, 0, 0)},
+            {"text": "Check", "rect": (158, 68, 40, 16), "bg_color": (0, 0, 0)},
+            {"text": "Note:", "rect": (204, 68, 36, 16), "bg_color": (0, 0, 0)},
+            {"text": "hi", "rect": (244, 68, 18, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered_colon = aot.filter_ocr_line_items(row_colon, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered_colon]), "Check Note: hi")
+
+        row_fused = [
+            {"text": "Alex:Welcome", "rect": (10, 90, 96, 16), "bg_color": (0, 0, 0)},
+            {"text": "back", "rect": (110, 90, 32, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered_fused = aot.filter_ocr_line_items(row_fused, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered_fused]), "Welcome back")
+        self.assertGreater(filtered_fused[0]["rect"][0], 10)  # box shifted right after 'Alex:'
+
+        row_fw = [
+            {"text": "Admin", "rect": (10, 112, 42, 16), "bg_color": (0, 0, 0)},
+            {"text": "：", "rect": (56, 112, 10, 16), "bg_color": (0, 0, 0)},
+            {"text": "Hello", "rect": (72, 112, 36, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered_fw = aot.filter_ocr_line_items(row_fw, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered_fw]), "Hello")
+
+        # URL and emoticon should NOT be cut at ':'
+        row_safe = [
+            {"text": "Visit", "rect": (10, 134, 34, 16), "bg_color": (0, 0, 0)},
+            {"text": "https://site.com", "rect": (50, 134, 110, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered_safe = aot.filter_ocr_line_items(row_safe, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered_safe]), "Visit https://site.com")
+
+        # Worker end-to-end with low-confidence standalone ':' glyph (conf=12)
+        colon_payload = {
+            "level": [5, 5, 5, 5, 5],
+            "block_num": [1, 1, 1, 1, 1],
+            "par_num": [1, 1, 1, 1, 1],
+            "line_num": [1, 1, 1, 1, 1],
+            "conf": ["95", "92", "12", "96", "94"],
+            "text": ["[VIP]", "Steve", ":", "Nice", "pickaxe"],
+            "left": [10, 50, 92, 104, 144],
+            "top": [20, 20, 20, 20, 20],
+            "width": [36, 38, 6, 36, 52],
+            "height": [16, 16, 16, 16, 16],
+        }
+        worker2 = aot.TranslationWorker(
+            pil_img=img, tess_lang="eng", target_lang="Vietnamese",
+            api_url="", api_key="", model_name="", last_raw_text="",
+            only_after_arrow=True,
+        )
+        emitted2 = []
+        worker2.finished_signal.connect(lambda blocks, msg: emitted2.append((blocks, msg)))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=colon_payload), \
+             patch.object(worker2, "translate_batch_with_context", return_value=["Cúp đẹp đấy"]) as mock_tr2:
+            worker2.run()
+            mock_tr2.assert_called_once_with(["Nice pickaxe"])
+        self.assertEqual(emitted2[0][0][0]["raw_line"], "Nice pickaxe")
+        self.assertEqual(emitted2[0][0][0]["text"], "Cúp đẹp đấy")
+
     def test_line_translation_cache_lru_and_scroll_reposition(self):
         """Verify LineTranslationCache LRU eviction, 0ms scroll Y-remapping, and zero duplicate chat stream entries."""
         cache = aot.LineTranslationCache(capacity=2)
