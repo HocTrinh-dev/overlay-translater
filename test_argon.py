@@ -1253,6 +1253,81 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertEqual(json.loads(sent["messages"][1]["content"]), ["Line five"])
         studio.close()
 
+    def test_ui_modal_local_bg_norm_column_split_and_sharp_replace(self):
+        """Verify local BG norm, multi-column splitting, prose colon safety, noise drop & sharp replace text."""
+        from PIL import ImageDraw
+
+        # 1. Uneven light-gray translucent UI panel with dark ink text -> crisp dark text on clean white paper
+        light_img = Image.new("RGB", (600, 300), (195, 200, 208))
+        draw = ImageDraw.Draw(light_img)
+        draw.rectangle([0, 0, 250, 300], fill=(135, 140, 148))  # Darker left stone background behind glass
+        draw.rectangle([280, 90, 420, 96], fill=(35, 38, 42))  # Dark ink stroke on translucent panel
+        w_light = aot.TranslationWorker(light_img, "eng", "Vietnamese", "", "", "", "")
+        prep_light, sc = w_light._prepare_ocr_image()
+        self.assertEqual(sc, 2)
+        self.assertEqual(prep_light.mode, "L")
+        self.assertGreater(prep_light.getpixel((40, 40)), 220)
+        self.assertGreater(prep_light.getpixel((900, 40)), 220)
+        self.assertLess(prep_light.getpixel((700, 186)), 80)
+
+        # 2. Multi-column UI row ('Status' + 280px gap + 'Open') splits into 2 separate lines,
+        #    prose colon ('Floor 3 awaits you. Join it: if...') is NOT stripped,
+        #    and low-confidence icon gibberish ('estimeit/', conf=32) is filtered out.
+        ui_ocr = {
+            "level": [5] * 9,
+            "block_num": [1] * 9,
+            "par_num": [1] * 9,
+            "line_num": [1, 1, 1, 1, 1, 1, 2, 2, 3],
+            "conf": ["95", "92", "90", "91", "93", "94", "96", "94", "32"],
+            "text": [
+                "Floor", "3", "awaits", "you.", "Join", "it:",
+                "Status", "Open",
+                "'estimeit/",
+            ],
+            "left":   [30, 80, 102, 160, 204, 246, 30, 420, 420],
+            "top":    [40, 40,  40,  40,  40,  40, 90,  90, 140],
+            "width":  [42, 16,  52,  38,  36,  28, 56,  46,  80],
+            "height": [18] * 9,
+        }
+        worker = aot.TranslationWorker(
+            light_img, "eng", "Vietnamese", "", "", "", "", only_after_arrow=True, skip_color_sampling=True
+        )
+        blocks_out = []
+        worker.finished_signal.connect(lambda b, m: blocks_out.append(b))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=ui_ocr), \
+             patch.object(
+                 worker,
+                 "translate_batch_with_context",
+                 return_value=["Tầng 3 đang đợi bạn. Tham gia:", "Trạng thái", "Mở"],
+             ) as mock_tr:
+            worker.run()
+        mock_tr.assert_called_once_with([
+            "Floor awaits you. Join it:",
+            "Status",
+            "Open",
+        ])
+        self.assertEqual(len(blocks_out[0]), 3)
+        self.assertEqual(blocks_out[0][1]["rect"][0], 30)
+        self.assertEqual(blocks_out[0][2]["rect"][0], 420)
+
+        # 3. Solid/chameleon 'replace' mode (mask_alpha >= 170) renders crisp text without fuzzy outline halo
+        hud = aot.FloatingOverlayHUD()
+        hud.setGeometry(0, 0, 400, 160)
+        hud.overlay_style = "replace"
+        hud.opacity_pct = 90
+        hud.blocks = [{
+            "rect": (20, 20, 180, 24),
+            "text": "Trạng thái",
+            "raw_line": "Status",
+            "bg_color": (205, 208, 212),
+            "fg_color": (25, 28, 32),
+            "word_masks": [],
+        }]
+        with patch.object(hud, "_draw_outlined_text") as mock_outline:
+            hud.grab()
+            mock_outline.assert_not_called()
+        hud.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -329,8 +329,26 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
         if not tok or (":" not in tok and "：" not in tok):
             continue
 
+        # Reject prose sentences that happen to contain ':' within the first 6 tokens
+        # (e.g. "Floor 3 awaits you. Join it: if its servers are full...")
+        prior_tokens = [line_items[j].get("text", "").strip() for j in range(idx)]
+        has_sentence_punct_before = any(
+            pt and not (pt.startswith(("[", "(", "<")) and pt.endswith(("]", ")", ">")))
+            and pt[-1] in (".", "!", "?", ",", ";", "。", "！", "？")
+            for pt in prior_tokens
+        )
+        if has_sentence_punct_before:
+            break
+
+        unbracketed_prior = sum(
+            1 for pt in prior_tokens
+            if pt and not (pt.startswith(("[", "(", "<")) or pt.endswith(("]", ")", ">")))
+        )
+
         # 2a. Standalone ':' or '：' (skip if splitting numeric time/ratio like '14 : 30')
         if tok in (":", "："):
+            if unbracketed_prior > 2:
+                continue
             if 0 < idx < n - 1:
                 prev_clean = line_items[idx - 1].get("text", "").strip().strip("[]() ")
                 next_clean = line_items[idx + 1].get("text", "").strip().strip("[]() ")
@@ -346,6 +364,12 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
             after_raw = tok[pos + 1:]
 
             if after_raw.startswith("//") or before.lower() in ("http", "https", "ftp"):
+                continue
+
+            unbracketed_total = unbracketed_prior + (
+                1 if before and not (before.startswith(("[", "(", "<")) or before.endswith(("]", ")", ">"))) else 0
+            )
+            if unbracketed_total > 2:
                 continue
 
             if not before:
@@ -394,12 +418,22 @@ def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) ->
     if n >= 2:
         avg_h = sum(it["rect"][3] for it in line_items) / n
         min_arrow_gap = max(24, int(avg_h * 1.45))
+        max_arrow_gap = max(68, int(avg_h * 3.2))
+        has_tag_marker = any(
+            it.get("text", "").strip().startswith(("[", "(", "<"))
+            or it.get("text", "").strip().endswith(("]", ")", ">"))
+            for it in line_items[:3]
+        )
         for idx in range(min(3, n - 1)):
             curr_r = line_items[idx]["rect"]
             next_r = line_items[idx + 1]["rect"]
             gap = next_r[0] - (curr_r[0] + curr_r[2])
-            if gap >= min_arrow_gap:
-                return line_items[idx + 1:]
+            if min_arrow_gap <= gap <= max_arrow_gap:
+                prefix_toks = [line_items[j].get("text", "").strip() for j in range(idx + 1)]
+                if any(pt and pt[-1] in (".", "!", "?", ",", ";") for pt in prefix_toks):
+                    continue
+                if has_tag_marker or idx == 0:
+                    return line_items[idx + 1:]
 
     return line_items
 
@@ -415,7 +449,10 @@ def filter_ocr_line_items(line_items: list, strip_after_arrow: bool = True) -> l
         cleaned_word = clean_special_chars_from_token(item.get("text", ""))
         if not cleaned_word:
             continue
-        filtered.append({"rect": item["rect"], "text": cleaned_word})
+        entry = {"rect": item["rect"], "text": cleaned_word}
+        if "conf" in item:
+            entry["conf"] = item["conf"]
+        filtered.append(entry)
     return filtered
 
 
@@ -1439,36 +1476,71 @@ class TranslationWorker(QThread):
 
     def _prepare_ocr_image(self):
         """
-        Preprocess capture screenshots for crisp Tesseract OCR accuracy using only PIL.Image
-        (bundled inside ArgonTranslator.exe):
-        - Convert to grayscale, invert dark game/chat backgrounds, and boost contrast by 1.8x via LUT.
-        - Upscale 2x using Image.Resampling.BILINEAR (coords scaled back by / 2).
-        Returns (prepared_img, scale_factor).
+        Fast pure-PIL.Image preprocessing (uses only `PIL.Image` so frozen ArgonTranslator.exe
+        never misses unbundled PIL submodules):
+        1. Suppresses textured/translucent game backgrounds via adaptive local background normalization
+           (downscale/upscale background estimate + Image.blend), preserving text on both uneven light
+           glass panels and dark chat overlays.
+        2. Auto-detects light-on-dark vs dark-on-light polarity from difference histogram tails and
+           maps background cleanly to white and ink strokes to crisp dark foreground.
+        3. Upscales 2x with BICUBIC (coords scaled back by / 2) for condensed/pixel game fonts.
         """
         img = self.pil_img
         w, h = img.size
         if w <= 0 or h <= 0:
             return img, 1
+
         gray = img.convert("L")
-        pix = gray.load()
-        step_x = max(1, w // 16)
-        step_y = max(1, h // 8)
-        total, count = 0, 0
-        for y in range(0, h, step_y):
-            for x in range(0, w, step_x):
-                total += pix[x, y]
-                count += 1
-        avg_lum = (total / count) if count > 0 else 128.0
-        is_dark = count > 0 and avg_lum < 128.0
-        pivot = (255.0 - avg_lum) if is_dark else avg_lum
-        lut = bytes(
-            max(0, min(255, round(pivot + 1.8 * (((255 - p) if is_dark else p) - pivot))))
-            for p in range(256)
-        )
-        gray = gray.point(lut)
-        resample_bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
+        resampling = getattr(Image, "Resampling", Image)
+        resample_bilinear = getattr(resampling, "BILINEAR", Image.BILINEAR)
+        resample_bicubic = getattr(resampling, "BICUBIC", Image.BICUBIC)
+
+        if w >= 32 and h >= 32:
+            gh = gray.histogram()
+            total_px = sum(gh)
+            cum = 0
+            p50 = 128
+            for v, cnt in enumerate(gh):
+                cum += cnt
+                if cum >= total_px * 0.5:
+                    p50 = v
+                    break
+            bw = max(4, w // 36)
+            bh = max(4, h // 36)
+            bg = gray.resize((bw, bh), resample_bilinear).resize((w, h), resample_bilinear)
+            inv_bg = bg.point(lambda p: 255 - p)
+            diff = Image.blend(gray, inv_bg, 0.5)
+            hist = diff.histogram()
+            dark_tail = sum(hist[:104])
+            bright_tail = sum(hist[152:])
+            use_dark_text = (p50 > 140) or (p50 >= 115 and dark_tail >= bright_tail)
+            gain = 3.4
+            deadzone = 3
+            lut = bytes(
+                max(0, min(255, 255 - max(0, round((((128 - p) if use_dark_text else (p - 128)) - deadzone) * gain))))
+                for p in range(256)
+            )
+            norm = diff.point(lut)
+        else:
+            pix = gray.load()
+            step_x = max(1, w // 16)
+            step_y = max(1, h // 8)
+            total, count = 0, 0
+            for y in range(0, h, step_y):
+                for x in range(0, w, step_x):
+                    total += pix[x, y]
+                    count += 1
+            avg_lum = (total / count) if count > 0 else 128.0
+            is_dark = count > 0 and avg_lum < 128.0
+            pivot = (255.0 - avg_lum) if is_dark else avg_lum
+            lut = bytes(
+                max(0, min(255, round(pivot + 1.8 * (((255 - p) if is_dark else p) - pivot))))
+                for p in range(256)
+            )
+            norm = gray.point(lut)
+
         scale = 2
-        upscaled = gray.resize((w * scale, h * scale), resample_bilinear)
+        upscaled = norm.resize((w * scale, h * scale), resample_bicubic)
         return upscaled, scale
 
     def _run_tesseract_ocr(self) -> tuple:
@@ -1506,6 +1578,7 @@ class TranslationWorker(QThread):
                 return
 
         # Group words into logical lines using (block_num, par_num, line_num)
+        # AND split multi-column UI rows separated by large horizontal gaps.
         lines = []
         current_line = []
         last_line_id = None
@@ -1524,11 +1597,20 @@ class TranslationWorker(QThread):
                     bx, by, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 line_id = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
 
-                if line_id != last_line_id and current_line:
+                split_gap = False
+                if line_id == last_line_id and current_line:
+                    prev_bx, prev_by, prev_bw, prev_bh = current_line[-1]['rect']
+                    ref_h = max(10.0, (prev_bh + bh) * 0.5)
+                    h_gap = bx - (prev_bx + prev_bw)
+                    col_gap_limit = max(44, int(ref_h * 3.0))
+                    if h_gap > col_gap_limit or (prev_bx - (bx + bw)) > max(44, int(ref_h * 2.0)):
+                        split_gap = True
+
+                if (line_id != last_line_id or split_gap) and current_line:
                     lines.append(current_line)
                     current_line = []
 
-                current_line.append({'rect': (bx, by, bw, bh), 'text': word})
+                current_line.append({'rect': (bx, by, bw, bh), 'text': word, 'conf': conf})
                 last_line_id = line_id
 
         if current_line:
@@ -1544,6 +1626,19 @@ class TranslationWorker(QThread):
             line_items = filter_ocr_line_items(raw_line_items, strip_after_arrow=self.only_after_arrow)
             if not line_items:
                 continue
+
+            # Drop low-confidence texture/icon noise fragments (e.g. faint UI borders or background grain)
+            confs = [it['conf'] for it in line_items if isinstance(it.get('conf'), (int, float))]
+            if confs:
+                avg_conf = sum(confs) / len(confs)
+                max_conf = max(confs)
+                if avg_conf < 42 and max_conf < 68:
+                    continue
+                if len(line_items) == 1:
+                    single_txt = line_items[0].get('text', '').strip()
+                    alpha_only = "".join(ch for ch in single_txt if ch.isalpha())
+                    if len(alpha_only) <= 3 and not _contains_cjk_or_hangul(single_txt) and confs[0] < 62:
+                        continue
 
             tokens = [item['text'] for item in line_items]
             if "+" in self.tess_lang or self.tess_lang in ["chi_sim", "jpn"]:
@@ -2621,14 +2716,20 @@ class FloatingOverlayHUD(QWidget):
             fg_qcolor, outline_qcolor = self._resolve_colors_for_block(
                 item['bg_rgb'], item['fg_rgb'], mode_key
             )
-            self._draw_outlined_text(
-                painter,
-                QRectF(item['lx'], item['ly'] + item['dy'], item['draw_w'], item['draw_h']),
-                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
-                item['text'],
-                fg_qcolor,
-                outline_qcolor
-            )
+            text_box = QRectF(item['lx'], item['ly'] + item['dy'], item['draw_w'], item['draw_h'])
+            text_flags = Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap
+            if mode_key == "replace" and mask_alpha >= 170:
+                painter.setPen(fg_qcolor)
+                painter.drawText(text_box, text_flags, item['text'])
+            else:
+                self._draw_outlined_text(
+                    painter,
+                    text_box,
+                    text_flags,
+                    item['text'],
+                    fg_qcolor,
+                    outline_qcolor
+                )
         painter.setOpacity(1.0)
 
     def _hit_test_resize_edge(self, pos: QPoint) -> str:
