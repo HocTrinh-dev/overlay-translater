@@ -313,6 +313,13 @@ class TestArgonOverlayTranslator(unittest.TestCase):
                     allowed_top_modules,
                     f"Module '{top_mod}' is not bundled in ArgonTranslator.exe launcher.py!"
                 )
+                if top_mod == "PIL":
+                    for alias in node.names:
+                        self.assertEqual(
+                            alias.name,
+                            "Image",
+                            f"PIL.{alias.name} is not bundled in ArgonTranslator.exe launcher.py!"
+                        )
 
     def test_multilang_chat_smart_join_and_vietnamese_skip(self):
         """Verify Multi-Language Chat OCR lang resolution, CJK+Latin token joiner, and skipping Vietnamese chat lines."""

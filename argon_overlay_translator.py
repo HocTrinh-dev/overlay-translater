@@ -6,7 +6,7 @@ import threading
 import subprocess
 import shutil
 import requests
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image
 import mss
 import pytesseract
 import keyboard
@@ -1439,9 +1439,9 @@ class TranslationWorker(QThread):
 
     def _prepare_ocr_image(self):
         """
-        Preprocess capture screenshots for crisp Tesseract OCR accuracy:
-        - Convert to grayscale and invert dark game/chat backgrounds via ImageOps.invert.
-        - Boost contrast by 1.8x via ImageEnhance.Contrast.
+        Preprocess capture screenshots for crisp Tesseract OCR accuracy using only PIL.Image
+        (bundled inside ArgonTranslator.exe):
+        - Convert to grayscale, invert dark game/chat backgrounds, and boost contrast by 1.8x via LUT.
         - Upscale 2x using Image.Resampling.BILINEAR (coords scaled back by / 2).
         Returns (prepared_img, scale_factor).
         """
@@ -1458,9 +1458,14 @@ class TranslationWorker(QThread):
             for x in range(0, w, step_x):
                 total += pix[x, y]
                 count += 1
-        if count > 0 and (total / count) < 128.0:
-            gray = ImageOps.invert(gray)
-        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        avg_lum = (total / count) if count > 0 else 128.0
+        is_dark = count > 0 and avg_lum < 128.0
+        pivot = (255.0 - avg_lum) if is_dark else avg_lum
+        lut = bytes(
+            max(0, min(255, round(pivot + 1.8 * (((255 - p) if is_dark else p) - pivot))))
+            for p in range(256)
+        )
+        gray = gray.point(lut)
         resample_bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
         scale = 2
         upscaled = gray.resize((w * scale, h * scale), resample_bilinear)
