@@ -1041,6 +1041,80 @@ class TestArgonOverlayTranslator(unittest.TestCase):
         self.assertFalse(studio2.chk_after_arrow.isChecked())
         studio2.close()
 
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_realtime_chat_responsiveness_and_small_update_detection(self, mock_hotkey):
+        """Verify 1-line chat updates trigger within 180ms, Stream Only uses 75ms watcher, and OCR/mss reuse work."""
+        from PIL import ImageDraw
+
+        # 1. Single-line short chat message has tiny global mean diff (< 1.4) yet triggers has_text_changed
+        img_bg = Image.new("RGB", (480, 260), (18, 22, 30))
+        img_small_chat = img_bg.copy()
+        draw = ImageDraw.Draw(img_small_chat)
+        draw.text((20, 222), "Steve: hello!", fill=(245, 245, 245))
+
+        sig_bg = aot.MainStudioWindow.compute_text_signature(img_bg)
+        sig_small = aot.MainStudioWindow.compute_text_signature(img_small_chat)
+        self.assertLess(aot.MainStudioWindow.frame_signature_diff(sig_bg, sig_small), 1.4)
+        self.assertTrue(aot.MainStudioWindow.has_text_changed(sig_bg, sig_small))
+
+        img_jitter = Image.new("RGB", (480, 260), (19, 23, 31))
+        ImageDraw.Draw(img_jitter).rectangle([10, 10, 110, 50], fill=(24, 28, 36))
+        sig_jitter = aot.MainStudioWindow.compute_text_signature(img_jitter)
+        self.assertFalse(aot.MainStudioWindow.has_text_changed(sig_bg, sig_jitter))
+
+        # 2. Stream mode enables 75ms change watcher even if capture_excluded is False, and triggers within 0.18s
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        studio.overlay_hud.capture_excluded = False
+        studio.cb_display_mode.setCurrentIndex(1)
+        studio.chk_auto.setChecked(True)
+        self.assertTrue(studio.change_watch_timer.isActive())
+        self.assertEqual(studio.change_watch_timer.interval(), 75)
+        self.assertFalse(studio.auto_timer.isActive())
+
+        img_small_chat_2 = img_small_chat.copy()
+        ImageDraw.Draw(img_small_chat_2).rectangle([20, 196, 175, 206], fill=(245, 245, 245))
+        studio.last_ocr_text_sig = sig_bg
+        studio.prev_watch_sig = sig_bg
+        studio.change_pending_since = None
+
+        with patch.object(studio, "_start_translation_worker") as mock_start:
+            with patch.object(studio, "_grab_raw_hud_image", return_value=img_small_chat):
+                studio._on_change_watch_tick()
+                mock_start.assert_not_called()
+                self.assertIsNotNone(studio.change_pending_since)
+            # Simulate continuous scroll past 0.18s cap with another distinct frame
+            studio.change_pending_since -= 0.20
+            with patch.object(studio, "_grab_raw_hud_image", return_value=img_small_chat_2):
+                studio._on_change_watch_tick()
+                mock_start.assert_called_once()
+
+        # 3. Stream mode passes skip_color_sampling=True and schedules immediate 20ms re-check after worker finishes
+        with patch.object(aot.TranslationWorker, "start"):
+            studio._start_translation_worker(img_small_chat, sig_small)
+            self.assertTrue(studio.worker.skip_color_sampling)
+            studio.worker = None
+
+        with patch("argon_overlay_translator.QTimer.singleShot") as mock_single:
+            studio._on_translation_done([], "No text")
+            mock_single.assert_any_call(20, studio._on_change_watch_tick)
+
+        # 4. OCR image prep inverts dark chat background and upscales 2x for sharp glyph recognition
+        worker = aot.TranslationWorker(img_small_chat, "eng", "Vietnamese", "", "", "", "")
+        prep_img, scale = worker._prepare_ocr_image()
+        self.assertEqual(scale, 2)
+        self.assertEqual(prep_img.size, (960, 520))
+        self.assertGreater(prep_img.getpixel((0, 0)), 200)
+
+        # 5. Persistent mss handle is reused across grabs and closed on closeEvent
+        studio._close_mss_instance()
+        with patch("argon_overlay_translator.mss.mss") as mock_mss:
+            sct1 = studio._get_mss_instance()
+            sct2 = studio._get_mss_instance()
+            self.assertIs(sct1, sct2)
+            mock_mss.assert_called_once()
+            studio.close()
+            mock_mss.return_value.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

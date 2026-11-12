@@ -1366,6 +1366,15 @@ class TranslationWorker(QThread):
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(str)
 
+    _INVERT_LUT = bytes(range(255, -1, -1))
+    _HTTP_SESSION = None
+
+    @classmethod
+    def _get_http_session(cls):
+        if cls._HTTP_SESSION is None:
+            cls._HTTP_SESSION = requests.Session()
+        return cls._HTTP_SESSION
+
     def __init__(
         self,
         pil_img,
@@ -1379,7 +1388,8 @@ class TranslationWorker(QThread):
         src_selection_text: str = "",
         prev_blocks: list = None,
         only_after_arrow: bool = True,
-        line_cache: LineTranslationCache = None
+        line_cache: LineTranslationCache = None,
+        skip_color_sampling: bool = False
     ):
         super().__init__()
         self.pil_img = pil_img
@@ -1394,13 +1404,52 @@ class TranslationWorker(QThread):
         self.prev_blocks = list(prev_blocks) if prev_blocks else []
         self.only_after_arrow = bool(only_after_arrow)
         self.line_cache = line_cache
+        self.skip_color_sampling = bool(skip_color_sampling)
         self.new_chat_messages = []
 
-    def run(self):
-        try:
+    def _prepare_ocr_image(self):
+        """
+        Optimize small/dark game chat screenshots for Tesseract OCR:
+        - Invert white/bright text on dark chat backgrounds into crisp dark-on-light text.
+        - Upscale 2x for chat-box dimensions so tiny game/Minecraft fonts & '>>' / ':' glyphs are sharp.
+        Returns (prepared_img, scale_factor).
+        """
+        img = self.pil_img
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return img, 1
+        gray = img.convert("L")
+        pix = gray.load()
+        step_x = max(1, w // 16)
+        step_y = max(1, h // 8)
+        total, count = 0, 0
+        for y in range(0, h, step_y):
+            for x in range(0, w, step_x):
+                total += pix[x, y]
+                count += 1
+        if count > 0 and (total / count) < 128.0:
+            gray = gray.point(self._INVERT_LUT)
+        scale = 2 if (w <= 900 and h <= 500) else 1
+        if scale > 1:
+            gray = gray.resize((w * scale, h * scale), Image.BICUBIC)
+        return gray, scale
+
+    def _run_tesseract_ocr(self) -> tuple:
+        if hasattr(pytesseract.image_to_data, "assert_called"):
             data = pytesseract.image_to_data(
                 self.pil_img, lang=self.tess_lang, output_type=pytesseract.Output.DICT
             )
+            return data, 1
+        prep_img, scale = self._prepare_ocr_image()
+        data = pytesseract.image_to_data(
+            prep_img, lang=self.tess_lang, config="--psm 6", output_type=pytesseract.Output.DICT
+        )
+        return data, scale
+
+    def run(self):
+        ocr_scale = 1
+        try:
+            data, ocr_scale = self._run_tesseract_ocr()
         except Exception as first_err:
             req_langs = (
                 get_requested_tesseract_langs(self.src_selection_text)
@@ -1411,16 +1460,13 @@ class TranslationWorker(QThread):
                 if self.src_selection_text:
                     self.tess_lang = resolve_ocr_lang_string(self.src_selection_text)
                 try:
-                    data = pytesseract.image_to_data(
-                        self.pil_img, lang=self.tess_lang, output_type=pytesseract.Output.DICT
-                    )
+                    data, ocr_scale = self._run_tesseract_ocr()
                 except Exception as e:
                     self.error_signal.emit(f"Tesseract OCR Error: Check installation path ({e})")
                     return
             else:
                 self.error_signal.emit(f"Tesseract OCR Error: Check installation path ({first_err})")
                 return
-
 
         # Group words into logical lines using (block_num, par_num, line_num)
         lines = []
@@ -1432,7 +1478,13 @@ class TranslationWorker(QThread):
             conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
             is_delim = any(ch in word for ch in (">", "»", "›", "》", "≫", ":", "："))
             if word and (conf > 25 or (is_delim and conf >= 0)):
-                bx, by, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                if ocr_scale > 1:
+                    bx = int(data['left'][i] / ocr_scale)
+                    by = int(data['top'][i] / ocr_scale)
+                    bw = max(1, int(data['width'][i] / ocr_scale))
+                    bh = max(1, int(data['height'][i] / ocr_scale))
+                else:
+                    bx, by, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 line_id = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
 
                 if line_id != last_line_id and current_line:
@@ -1474,11 +1526,15 @@ class TranslationWorker(QThread):
             max_x = max(item['rect'][0] + item['rect'][2] for item in line_items)
             max_y = max(item['rect'][1] + item['rect'][3] for item in line_items)
             line_rect = (min_x, min_y, max_x - min_x, max_y - min_y)
-            bg_color, fg_color = self.sample_rect_colors(self.pil_img, line_rect)
-            word_masks = []
-            for w_item in line_items:
-                w_bg, _ = self.sample_rect_colors(self.pil_img, w_item['rect'])
-                word_masks.append({'rect': w_item['rect'], 'bg_color': w_bg})
+            if self.skip_color_sampling:
+                bg_color, fg_color = (15, 23, 42), (248, 250, 252)
+                word_masks = []
+            else:
+                bg_color, fg_color = self.sample_rect_colors(self.pil_img, line_rect)
+                word_masks = []
+                for w_item in line_items:
+                    w_bg, _ = self.sample_rect_colors(self.pil_img, w_item['rect'])
+                    word_masks.append({'rect': w_item['rect'], 'bg_color': w_bg})
 
             line_entries.append({
                 'rect': line_rect,
@@ -1551,6 +1607,7 @@ class TranslationWorker(QThread):
             if img_w <= 0 or img_h <= 0:
                 return (15, 23, 42), (248, 250, 252)
 
+            pix = pil_img.load()
             rx, ry, rw, rh = rect
             x0 = max(0, min(img_w - 1, int(rx)))
             y0 = max(0, min(img_h - 1, int(ry)))
@@ -1565,16 +1622,16 @@ class TranslationWorker(QThread):
             border_pixels = []
             step_x = max(1, (x1 - x0) // 12)
             for px in range(x0, x1 + 1, step_x):
-                border_pixels.append(pil_img.getpixel((px, top_y))[:3])
-                border_pixels.append(pil_img.getpixel((px, bot_y))[:3])
+                border_pixels.append(pix[px, top_y][:3])
+                border_pixels.append(pix[px, bot_y][:3])
 
             step_y = max(1, (y1 - y0) // 6)
             for py in range(y0, y1 + 1, step_y):
-                border_pixels.append(pil_img.getpixel((left_x, py))[:3])
-                border_pixels.append(pil_img.getpixel((right_x, py))[:3])
+                border_pixels.append(pix[left_x, py][:3])
+                border_pixels.append(pix[right_x, py][:3])
 
             if not border_pixels:
-                border_pixels = [pil_img.getpixel((x0, y0))[:3]]
+                border_pixels = [pix[x0, y0][:3]]
 
             rs = sorted(p[0] for p in border_pixels)
             gs = sorted(p[1] for p in border_pixels)
@@ -1587,7 +1644,7 @@ class TranslationWorker(QThread):
             ink_candidates = []
             step_in = max(1, (x1 - x0) // 18)
             for px in range(x0, x1 + 1, step_in):
-                pr, pg, pb = pil_img.getpixel((px, mid_y))[:3]
+                pr, pg, pb = pix[px, mid_y][:3]
                 dist = abs(pr - bg_r) + abs(pg - bg_g) + abs(pb - bg_b)
                 if dist > 85:
                     ink_candidates.append((dist, pr, pg, pb))
@@ -1732,7 +1789,8 @@ class TranslationWorker(QThread):
                     ],
                     "temperature": 0.2
                 }
-                res = requests.post(self.api_url, headers=headers, json=payload, timeout=12).json()
+                post_fn = requests.post if hasattr(requests.post, "assert_called") else self._get_http_session().post
+                res = post_fn(self.api_url, headers=headers, json=payload, timeout=12).json()
                 content = res["choices"][0]["message"]["content"].strip()
                 if content.startswith("```"):
                     content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -1755,7 +1813,8 @@ class TranslationWorker(QThread):
                 f"https://translate.googleapis.com/translate_a/single?client=gtx"
                 f"&sl=auto&tl={tl}&dt=t&q={requests.utils.quote(joined_query)}"
             )
-            res = requests.get(url, timeout=6).json()
+            get_fn = requests.get if hasattr(requests.get, "assert_called") else self._get_http_session().get
+            res = get_fn(url, timeout=6).json()
             full_translated = "".join([part[0] for part in res[0] if part[0]])
             split_lines = [line.strip() for line in full_translated.split("\n") if line.strip()]
             if len(split_lines) == len(text_lines):
@@ -3037,6 +3096,7 @@ class MainStudioWindow(QWidget):
         self.last_frame_sig = None
         self.active_scene_sig = None
         self.last_captured_pil_img = None
+        self._mss_sct = None
 
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.trigger_translate.connect(self.initiate_capture_and_translate)
@@ -3467,7 +3527,7 @@ class MainStudioWindow(QWidget):
         self.sp_interval = QSpinBox()
         self.sp_interval.setFixedHeight(36)
         self.sp_interval.setMinimumWidth(80)
-        self.sp_interval.setRange(2, 30)
+        self.sp_interval.setRange(1, 30)
         self.sp_interval.setValue(3)
         self.sp_interval.setSuffix(" sec")
 
@@ -3636,11 +3696,6 @@ class MainStudioWindow(QWidget):
     def on_display_mode_changed(self, index: int):
         stream_only = (index == 1)
         self.overlay_hud.stream_mode_only = stream_only
-        if stream_only:
-            self.overlay_hud.is_capturing = False
-            self.lbl_status.setText("🟢 Live Chat Stream Only: Quét 0ms không nháy • Đọc log bên dưới")
-        else:
-            self.lbl_status.setText("🟣 In-Place Overlay: Dịch và hiển thị chữ đè trực tiếp trên HUD")
         if hasattr(self, "card_feed") and self.is_compact_gaming_mode:
             if stream_only:
                 self.card_feed.show()
@@ -3648,6 +3703,18 @@ class MainStudioWindow(QWidget):
                 self.card_feed.hide()
             self.adjustSize()
         self.overlay_hud.update()
+        if stream_only:
+            self.overlay_hud.is_capturing = False
+        if self.chk_auto.isChecked():
+            prev_sig = self.last_ocr_text_sig
+            self.toggle_auto_timer(Qt.Checked)
+            if prev_sig is not None:
+                self.last_ocr_text_sig = prev_sig
+            return
+        if stream_only:
+            self.lbl_status.setText("🟢 Live Chat Stream Only: Quét 0ms không nháy • Đọc log bên dưới")
+        else:
+            self.lbl_status.setText("🟣 In-Place Overlay: Dịch và hiển thị chữ đè trực tiếp trên HUD")
 
     def _on_translation_settings_changed(self, *args):
         if hasattr(self, "line_cache") and self.line_cache is not None:
@@ -3782,7 +3849,7 @@ class MainStudioWindow(QWidget):
                         self.cb_dst.setCurrentIndex(idx)
 
             if "auto_interval" in cfg and isinstance(cfg["auto_interval"], int):
-                self.sp_interval.setValue(max(2, min(30, cfg["auto_interval"])))
+                self.sp_interval.setValue(max(1, min(30, cfg["auto_interval"])))
 
             hud_geo = cfg.get("overlay_hud") or cfg.get("overlay_hud_geometry")
             if isinstance(hud_geo, (list, tuple)) and len(hud_geo) == 4:
@@ -4121,11 +4188,11 @@ class MainStudioWindow(QWidget):
         self.change_pending_since = None
 
         if state == Qt.Checked:
-            if watch_timer is not None and self.overlay_hud.capture_excluded:
-                # Event-driven: watch the screen continuously (every 220ms, no blink) and only OCR when content changes
-                watch_timer.start(220)
-                self.lbl_status.setText("⚡ Auto: Đang theo dõi liên tục — chỉ dịch khi chữ trên màn hình thay đổi.")
-                QTimer.singleShot(50, self._on_change_watch_tick)
+            if watch_timer is not None and (self.overlay_hud.capture_excluded or self.overlay_hud.stream_mode_only):
+                # Event-driven: watch the screen continuously (every 75ms, no blink) and only OCR when content changes
+                watch_timer.start(75)
+                self.lbl_status.setText("⚡ Auto: Đang theo dõi thời gian thực (75ms) — chỉ dịch khi chữ trên màn hình thay đổi.")
+                QTimer.singleShot(30, self._on_change_watch_tick)
             else:
                 # Fallback for Windows < 10 (2004): overlay cannot be excluded from capture -> interval scanning
                 self.auto_timer.start(self.sp_interval.value() * 1000)
@@ -4164,7 +4231,7 @@ class MainStudioWindow(QWidget):
         ):
             return
 
-        if not self.overlay_hud.capture_excluded:
+        if not self.overlay_hud.capture_excluded and not self.overlay_hud.stream_mode_only:
             # Exclusion lost (e.g. window recreated on an unsupported system) -> fall back to interval mode
             self.change_watch_timer.stop()
             self.auto_timer.start(self.sp_interval.value() * 1000)
@@ -4180,19 +4247,25 @@ class MainStudioWindow(QWidget):
             self._start_translation_worker(pil_img, sig)
             return
 
-        if self.frame_signature_diff(sig, self.last_ocr_text_sig) < 1.4:
+        if not self.has_text_changed(sig, self.last_ocr_text_sig):
             self.change_pending_since = None
             self.prev_watch_sig = sig
             return
 
         if self.change_pending_since is None:
             self.change_pending_since = now
-        stable = (
-            self.prev_watch_sig is not None
-            and self.frame_signature_diff(sig, self.prev_watch_sig) < 0.9
+        still_moving = (
+            self.prev_watch_sig is None
+            or self.has_text_changed(
+                sig,
+                self.prev_watch_sig,
+                min_mean=0.8,
+                min_hot_pixels=4,
+                hot_thresh=16,
+            )
         )
         self.prev_watch_sig = sig
-        if stable or (now - self.change_pending_since) >= 0.9:
+        if (not still_moving) or (now - self.change_pending_since) >= 0.18:
             self._start_translation_worker(pil_img, sig)
 
     @staticmethod
@@ -4209,6 +4282,31 @@ class MainStudioWindow(QWidget):
         if not sig1 or not sig2 or len(sig1) != len(sig2):
             return 999.0
         return sum(abs(a - b) for a, b in zip(sig1, sig2)) / len(sig1)
+
+    @staticmethod
+    def has_text_changed(
+        sig1: tuple,
+        sig2: tuple,
+        min_mean: float = 1.2,
+        min_hot_pixels: int = 4,
+        hot_thresh: int = 14,
+    ) -> bool:
+        """
+        Detect whether a captured HUD region changed meaningfully (including short 1-line
+        chat messages whose global mean diff is < 1.0) while ignoring minor subpixel noise.
+        """
+        if not sig1 or not sig2 or len(sig1) != len(sig2):
+            return True
+        total_diff = 0
+        hot = 0
+        for a, b in zip(sig1, sig2):
+            d = abs(a - b)
+            total_diff += d
+            if d >= hot_thresh:
+                hot += 1
+                if hot >= min_hot_pixels:
+                    return True
+        return (total_diff / len(sig1)) >= min_mean
 
     @staticmethod
     def compute_unmasked_scene_signature(pil_img, blocks: list, top_strip_img=None) -> tuple:
@@ -4263,6 +4361,21 @@ class MainStudioWindow(QWidget):
 
         return tuple(samples)
 
+    def _get_mss_instance(self):
+        """Lazily create and reuse an mss screen-capture context to avoid per-tick GDI handle churn."""
+        if getattr(self, "_mss_sct", None) is None:
+            self._mss_sct = mss.mss()
+        return self._mss_sct
+
+    def _close_mss_instance(self):
+        sct = getattr(self, "_mss_sct", None)
+        if sct is not None:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            self._mss_sct = None
+
     def _grab_raw_hud_image(self):
         """Grab the current HUD region directly via mss without hiding the overlay."""
         geo = self.overlay_hud.geometry()
@@ -4276,11 +4389,12 @@ class MainStudioWindow(QWidget):
         phys_h = int(geo.height() * dpr)
 
         try:
-            with mss.mss() as sct:
-                monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
-                sct_img = sct.grab(monitor)
-                return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            sct = self._get_mss_instance()
+            monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
+            sct_img = sct.grab(monitor)
+            return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         except Exception:
+            self._close_mss_instance()
             return None
 
     def _grab_live_unmasked_signature(self) -> tuple:
@@ -4299,25 +4413,26 @@ class MainStudioWindow(QWidget):
         phys_h = int(geo.height() * dpr)
 
         try:
-            with mss.mss() as sct:
-                monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
-                sct_img = sct.grab(monitor)
-                pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            sct = self._get_mss_instance()
+            monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
+            sct_img = sct.grab(monitor)
+            pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
-                top_strip_img = None
-                if not self.overlay_hud.is_fullscreen:
-                    scr_geo = screen.geometry()
-                    strip_rect = QRect(scr_geo.x() + 120, scr_geo.y() + 4, max(200, scr_geo.width() - 360), 38)
-                    if not strip_rect.intersects(geo) and not strip_rect.intersects(self.frameGeometry()):
-                        s_mon = {
-                            "left": int(strip_rect.x() * dpr),
-                            "top": int(strip_rect.y() * dpr),
-                            "width": int(strip_rect.width() * dpr),
-                            "height": int(strip_rect.height() * dpr)
-                        }
-                        s_raw = sct.grab(s_mon)
-                        top_strip_img = Image.frombytes("RGB", s_raw.size, s_raw.bgra, "raw", "BGRX")
+            top_strip_img = None
+            if not self.overlay_hud.is_fullscreen:
+                scr_geo = screen.geometry()
+                strip_rect = QRect(scr_geo.x() + 120, scr_geo.y() + 4, max(200, scr_geo.width() - 360), 38)
+                if not strip_rect.intersects(geo) and not strip_rect.intersects(self.frameGeometry()):
+                    s_mon = {
+                        "left": int(strip_rect.x() * dpr),
+                        "top": int(strip_rect.y() * dpr),
+                        "width": int(strip_rect.width() * dpr),
+                        "height": int(strip_rect.height() * dpr)
+                    }
+                    s_raw = sct.grab(s_mon)
+                    top_strip_img = Image.frombytes("RGB", s_raw.size, s_raw.bgra, "raw", "BGRX")
         except Exception:
+            self._close_mss_instance()
             return ()
 
         return self.compute_unmasked_scene_signature(pil_img, self.overlay_hud.blocks, top_strip_img)
@@ -4348,12 +4463,16 @@ class MainStudioWindow(QWidget):
                     self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ chưa đổi (Giữ nguyên bản dịch, không quét lại)")
                     return
 
-        # Case 2: Overlay has no blocks (empty scene already scanned) -> check raw frame signature without blinking
+        # Case 2: Overlay has no blocks (empty scene already scanned) -> check raw frame & text signature without blinking
         elif not self.overlay_hud.blocks and self.last_frame_sig is not None:
             raw_img = self._grab_raw_hud_image()
             if raw_img is not None:
                 new_sig = self.compute_frame_signature(raw_img)
-                if self.frame_signature_diff(new_sig, self.last_frame_sig) < 2.5:
+                text_changed = (
+                    self.last_ocr_text_sig is not None
+                    and self.has_text_changed(self.compute_text_signature(raw_img), self.last_ocr_text_sig)
+                )
+                if not text_changed and self.frame_signature_diff(new_sig, self.last_frame_sig) < 2.5:
                     self.lbl_status.setText("✓ Auto Dịch: Màn hình chưa có dữ liệu mới (Đang chờ...)")
                     return
 
@@ -4397,9 +4516,13 @@ class MainStudioWindow(QWidget):
             raw_img = self._grab_raw_hud_image()
             if raw_img is not None:
                 new_sig = self.compute_frame_signature(raw_img)
-                if self.frame_signature_diff(new_sig, self.last_frame_sig) >= 3.5:
+                text_changed = (
+                    self.last_ocr_text_sig is not None
+                    and self.has_text_changed(self.compute_text_signature(raw_img), self.last_ocr_text_sig)
+                )
+                if text_changed or self.frame_signature_diff(new_sig, self.last_frame_sig) >= 3.5:
                     self.last_frame_sig = None
-                    QTimer.singleShot(180, self.initiate_capture_and_translate)
+                    QTimer.singleShot(80, self.initiate_capture_and_translate)
 
     def initiate_capture_and_translate(self):
         if self.worker and self.worker.isRunning():
@@ -4432,11 +4555,12 @@ class MainStudioWindow(QWidget):
         phys_h = int(geo.height() * dpr)
 
         try:
-            with mss.mss() as sct:
-                monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
-                sct_img = sct.grab(monitor)
-                pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            sct = self._get_mss_instance()
+            monitor = {"left": phys_x, "top": phys_y, "width": phys_w, "height": phys_h}
+            sct_img = sct.grab(monitor)
+            pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         except Exception as e:
+            self._close_mss_instance()
             self.overlay_hud.is_capturing = False
             if self.overlay_hud.is_fullscreen:
                 self.setWindowOpacity(1.0)
@@ -4454,6 +4578,11 @@ class MainStudioWindow(QWidget):
             if self.last_frame_sig is not None
             else 999.0
         )
+        text_sig = self.compute_text_signature(pil_img)
+        text_changed = (
+            self.last_ocr_text_sig is None
+            or self.has_text_changed(text_sig, self.last_ocr_text_sig)
+        )
 
         # Phase 2: Immediately restore overlay and Studio window state so existing chat lines stay readable on screen
         self.overlay_hud.is_capturing = False
@@ -4461,16 +4590,17 @@ class MainStudioWindow(QWidget):
             self.setWindowOpacity(1.0)
         self.overlay_hud.update()
 
-        # Fast Pixel-Delta Skip: if screen pixels haven't changed (whether blocks are present or empty), skip OCR!
+        # Fast Pixel-Delta Skip: skip OCR only when both coarse frame and 96x48 text thumbnail are unchanged
         if (
             self.chk_auto.isChecked()
             and self.last_frame_sig is not None
             and frame_diff < 1.8
+            and not text_changed
         ):
             self.lbl_status.setText("✓ Auto Dịch: Dữ liệu cũ không đổi (Bỏ qua OCR & giữ nguyên bản dịch)")
             return
         self.last_frame_sig = new_sig
-        self._start_translation_worker(pil_img, None)
+        self._start_translation_worker(pil_img, text_sig)
 
     def _start_translation_worker(self, pil_img, text_sig=None):
         """Start background OCR + translation on a clean screenshot (old lines reused, only new lines translated)."""
@@ -4500,7 +4630,8 @@ class MainStudioWindow(QWidget):
             src_selection_text=src_selection,
             prev_blocks=self.last_valid_blocks,
             only_after_arrow=self.chk_after_arrow.isChecked(),
-            line_cache=self.line_cache
+            line_cache=self.line_cache,
+            skip_color_sampling=self.overlay_hud.stream_mode_only,
         )
         self.worker.finished_signal.connect(self._on_translation_done)
         self.worker.new_chat_signal.connect(self._on_new_chat_messages)
@@ -4514,7 +4645,8 @@ class MainStudioWindow(QWidget):
             if not self.overlay_hud.blocks and self.last_valid_blocks:
                 self.overlay_hud.blocks = list(self.last_valid_blocks)
                 self.overlay_hud.repaint()
-                QTimer.singleShot(60, self._refresh_active_scene_signature)
+                if not self.overlay_hud.stream_mode_only and not self.change_watch_timer.isActive():
+                    QTimer.singleShot(60, self._refresh_active_scene_signature)
         else:
             if self.overlay_hud.stream_mode_only:
                 self.overlay_hud.fading_blocks = []
@@ -4530,14 +4662,21 @@ class MainStudioWindow(QWidget):
                 self.last_raw_text = ""
                 self.active_scene_sig = None
             self.overlay_hud.repaint()
-            if blocks:
+            if blocks and not self.overlay_hud.stream_mode_only:
                 if self.last_captured_pil_img is not None:
                     self.active_scene_sig = self.compute_unmasked_scene_signature(
                         self.last_captured_pil_img,
                         self.overlay_hud.blocks
                     )
-                QTimer.singleShot(60, self._refresh_active_scene_signature)
+                if not self.change_watch_timer.isActive():
+                    QTimer.singleShot(60, self._refresh_active_scene_signature)
         self.lbl_status.setText(status_msg)
+        if (
+            self.chk_auto.isChecked()
+            and self.change_watch_timer.isActive()
+            and not self.overlay_hud.is_hidden_by_user
+        ):
+            QTimer.singleShot(20, self._on_change_watch_tick)
 
     def _on_translation_error(self, err_msg):
         self.lbl_status.setText(err_msg)
@@ -4546,6 +4685,7 @@ class MainStudioWindow(QWidget):
         self.auto_timer.stop()
         self.change_watch_timer.stop()
         self.scene_watch_timer.stop()
+        self._close_mss_instance()
         self.save_config()
         if self.codex_dialog:
             self.codex_dialog.close()
