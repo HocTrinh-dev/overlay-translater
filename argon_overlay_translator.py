@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QCheckBox, QFrame, QInputDialog,
     QListView, QDialog, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QFileDialog, QMessageBox
+    QHeaderView, QAbstractItemView, QFileDialog, QMessageBox, QTextEdit
 )
 
 # High-DPI synchronization for 125% / 150% / 4K Windows displays
@@ -202,13 +202,114 @@ def is_symbol_or_number_only(text: str) -> bool:
     return valid_words == 0
 
 
-def filter_ocr_line_items(line_items: list) -> list:
+_CHAT_ARROW_DELIMITERS = (">>", "»", "》", "≫", "››", ">›", "›>", ">=", "=>", "->", ":>")
+
+
+def _is_arrow_delimiter_token(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    if any(d in t for d in _CHAT_ARROW_DELIMITERS):
+        return True
+    stripped = t.strip(">›=-: ")
+    return stripped == "" and (">" in t or "›" in t)
+
+
+def strip_chat_prefix_items(line_items: list, strip_after_arrow: bool = True) -> list:
     """
-    Filter out OCR word items that are purely numbers, special characters, or stat counters,
-    and clean special noise characters from valid word tokens so overlay masks never cover numbers/symbols.
+    For game/Minecraft chat lines formatted like `[Rank] PlayerName >> message` (or `»`, `> >`, `>`),
+    discard all tokens before and including `>>` so ONLY the message after `>>` is translated
+    and the overlay bounding box starts right after `>>` (leaving Rank & PlayerName untouched).
     """
+    if not strip_after_arrow or not line_items:
+        return line_items
+
+    n = len(line_items)
+    # Pass 1: Explicit '>>', '»', '> >', or '>' delimiter token
+    for idx, item in enumerate(line_items):
+        tok = item.get("text", "").strip()
+        if not tok:
+            continue
+
+        # 1a. Two adjacent '>' tokens (e.g. '>>' split by OCR into '>' and '>')
+        if idx + 1 < n:
+            next_item = line_items[idx + 1]
+            next_tok = next_item.get("text", "").strip()
+            if (tok.endswith(">") or tok.endswith("›")) and (next_tok.startswith(">") or next_tok.startswith("›")):
+                after_next = next_tok.lstrip(">›=-: ").strip()
+                if not after_next:
+                    return line_items[idx + 2:]
+                nbx, nby, nbw, nbh = next_item["rect"]
+                prefix_chars = len(next_tok) - len(after_next)
+                shift_x = int(nbw * prefix_chars / max(1, len(next_tok)))
+                adj_item = {
+                    "rect": (nbx + shift_x, nby, max(8, nbw - shift_x), nbh),
+                    "text": after_next,
+                }
+                return [adj_item] + line_items[idx + 2:]
+
+        # 1b. Token contains a double-arrow / chat separator ('>>', '»', '>=', '->', etc.)
+        matched_delim = None
+        matched_pos = -1
+        for delim in _CHAT_ARROW_DELIMITERS:
+            pos = tok.rfind(delim)
+            if pos >= 0 and pos + len(delim) > matched_pos:
+                matched_delim = delim
+                matched_pos = pos
+        if matched_delim is not None:
+            end_pos = matched_pos + len(matched_delim)
+            after_str = tok[end_pos:].lstrip(">›=-: ").strip()
+            if not after_str:
+                return line_items[idx + 1:]
+            bx, by, bw, bh = item["rect"]
+            prefix_chars = len(tok) - len(after_str)
+            shift_x = int(bw * prefix_chars / max(1, len(tok)))
+            adj_item = {
+                "rect": (bx + shift_x, by, max(8, bw - shift_x), bh),
+                "text": after_str,
+            }
+            return [adj_item] + line_items[idx + 1:]
+
+        # 1c. Single '>' or '›' in the prefix area (when OCR merges '>>' into '>' in pixel font, or '<Name>')
+        if idx <= 4:
+            if _is_arrow_delimiter_token(tok):
+                return line_items[idx + 1:]
+            if (tok.endswith(">") or tok.endswith("›")) and len(tok) > 1:
+                return line_items[idx + 1:]
+            if idx >= 1 and (tok.startswith(">") or tok.startswith("›")):
+                after_str = tok.lstrip(">›=-: ").strip()
+                if after_str:
+                    bx, by, bw, bh = item["rect"]
+                    prefix_chars = len(tok) - len(after_str)
+                    shift_x = int(bw * prefix_chars / max(1, len(tok)))
+                    adj_item = {
+                        "rect": (bx + shift_x, by, max(8, bw - shift_x), bh),
+                        "text": after_str,
+                    }
+                    return [adj_item] + line_items[idx + 1:]
+
+    # Pass 2: Wide horizontal gap fallback (when dark-gray '&8>>' was not recognized as a glyph by OCR)
+    if n >= 2:
+        avg_h = sum(it["rect"][3] for it in line_items) / n
+        min_arrow_gap = max(24, int(avg_h * 1.45))
+        for idx in range(min(3, n - 1)):
+            curr_r = line_items[idx]["rect"]
+            next_r = line_items[idx + 1]["rect"]
+            gap = next_r[0] - (curr_r[0] + curr_r[2])
+            if gap >= min_arrow_gap:
+                return line_items[idx + 1:]
+
+    return line_items
+
+
+def filter_ocr_line_items(line_items: list, strip_after_arrow: bool = True) -> list:
+    """
+    Strip chat prefix before `>>` (Rank & PlayerName), filter out OCR word items that are purely
+    numbers, special characters, or stat counters, and clean special noise characters from valid tokens.
+    """
+    working_items = strip_chat_prefix_items(line_items, strip_after_arrow=strip_after_arrow)
     filtered = []
-    for item in line_items:
+    for item in working_items:
         cleaned_word = clean_special_chars_from_token(item.get("text", ""))
         if not cleaned_word:
             continue
@@ -1131,11 +1232,67 @@ def is_same_ocr_data(new_raw: str, old_raw: str) -> bool:
     return False
 
 
+class LineTranslationCache:
+    """
+    Thread-safe Line-Level LRU Cache (max `capacity` entries).
+    Normalizes OCR lines so scrolled chat lines resolve in 0ms at their new Y
+    coordinates without duplicate API calls or duplicate Live Stream log entries.
+    """
+
+    def __init__(self, capacity: int = 600):
+        self.capacity = max(1, int(capacity))
+        self._lock = threading.RLock()
+        self._cache = {}  # Python 3.7+ preserves insertion order
+
+    @staticmethod
+    def normalize_key(text: str) -> str:
+        if not text:
+            return ""
+        return " ".join(str(text).strip().split()).lower()
+
+    def _make_key(self, raw_line: str, target_lang: str = ""):
+        norm = self.normalize_key(raw_line)
+        if not norm:
+            return None
+        return (str(target_lang or "").strip().lower(), norm)
+
+    def get(self, raw_line: str, target_lang: str = ""):
+        key = self._make_key(raw_line, target_lang)
+        if key is None:
+            return None
+        with self._lock:
+            val = self._cache.pop(key, None)
+            if val is not None:
+                self._cache[key] = val
+            return val
+
+    def put(self, raw_line: str, translated: str, target_lang: str = ""):
+        key = self._make_key(raw_line, target_lang)
+        if key is None or translated is None:
+            return
+        with self._lock:
+            if key in self._cache:
+                self._cache.pop(key)
+            elif len(self._cache) >= self.capacity:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            self._cache[key] = str(translated)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._cache)
+
+
 # =====================================================================
 # 1. BACKGROUND WORKER: OCR & BATCH CONTEXTUAL TRANSLATION (QTHREAD)
 # =====================================================================
 class TranslationWorker(QThread):
     finished_signal = pyqtSignal(object, str)  # (list_of_blocks_or_None, status_message)
+    new_chat_signal = pyqtSignal(object)       # list of (raw_line, translated_text) tuples
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(str)
 
@@ -1150,7 +1307,9 @@ class TranslationWorker(QThread):
         last_raw_text,
         knowledge_mgr: TranslationKnowledgeManager = None,
         src_selection_text: str = "",
-        prev_blocks: list = None
+        prev_blocks: list = None,
+        only_after_arrow: bool = True,
+        line_cache: LineTranslationCache = None
     ):
         super().__init__()
         self.pil_img = pil_img
@@ -1163,6 +1322,9 @@ class TranslationWorker(QThread):
         self.knowledge_mgr = knowledge_mgr
         self.src_selection_text = src_selection_text
         self.prev_blocks = list(prev_blocks) if prev_blocks else []
+        self.only_after_arrow = bool(only_after_arrow)
+        self.line_cache = line_cache
+        self.new_chat_messages = []
 
     def run(self):
         try:
@@ -1198,7 +1360,8 @@ class TranslationWorker(QThread):
         for i in range(len(data['text'])):
             word = data['text'][i].strip()
             conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
-            if word and conf > 25:
+            is_delim = any(ch in word for ch in (">", "»", "›", "》", "≫"))
+            if word and (conf > 25 or (is_delim and conf >= 0)):
                 bx, by, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 line_id = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
 
@@ -1219,7 +1382,7 @@ class TranslationWorker(QThread):
         line_entries = []
         skipped_native = 0
         for raw_line_items in lines:
-            line_items = filter_ocr_line_items(raw_line_items)
+            line_items = filter_ocr_line_items(raw_line_items, strip_after_arrow=self.only_after_arrow)
             if not line_items:
                 continue
 
@@ -1262,11 +1425,21 @@ class TranslationWorker(QThread):
                 self.finished_signal.emit([], "No text detected in capture region.")
             return
 
+        line_entries.sort(key=lambda e: (e['rect'][1], e['rect'][0]))
         combined_raw = "\n".join([entry['raw_text'] for entry in line_entries])
         if is_same_ocr_data(combined_raw, self.last_raw_text):
-            self.finished_signal.emit(None, "✓ Dữ liệu cũ không đổi (Không cần dịch lại)")
-            return
+            y_shifted = False
+            if self.prev_blocks and len(self.prev_blocks) == len(line_entries):
+                for entry, pb in zip(line_entries, self.prev_blocks):
+                    pb_rect = pb.get('rect', (0, 0, 0, 0))
+                    if abs(entry['rect'][1] - pb_rect[1]) > 6 or abs(entry['rect'][0] - pb_rect[0]) > 6:
+                        y_shifted = True
+                        break
+            if not y_shifted:
+                self.finished_signal.emit(None, "✓ Dữ liệu cũ không đổi (Không cần dịch lại)")
+                return
 
+        self.new_chat_messages = []
         raw_list = [entry['raw_text'] for entry in line_entries]
         translated_list, cache_hits = self.resolve_with_cache_and_translate(raw_list)
 
@@ -1282,6 +1455,9 @@ class TranslationWorker(QThread):
                 'fg_color': entry.get('fg_color', (248, 250, 252)),
                 'word_masks': entry.get('word_masks', [])
             })
+
+        if self.new_chat_messages:
+            self.new_chat_signal.emit(list(self.new_chat_messages))
 
         timestamp = time.strftime('%H:%M:%S')
         ai_calls = len(raw_list) - cache_hits
@@ -1364,16 +1540,25 @@ class TranslationWorker(QThread):
 
     def resolve_with_cache_and_translate(self, text_lines: list):
         """
-        Check previous on-screen blocks and local Cache/Codex first;
+        Check LineTranslationCache, previous on-screen blocks, and persistent Cache/Codex first;
         ONLY translate genuinely NEW lines that haven't been translated yet.
         """
         final_translations = [None] * len(text_lines)
         missing_indices = []
         missing_lines = []
+        newly_seen_indices = []
         cache_hits = 0
 
         for idx, line in enumerate(text_lines):
-            # 1. Reuse existing on-screen block translation if this line is already on screen (old data)
+            # 1. Line-Level LRU Cache (0ms scroll/reposition hit across frames)
+            if self.line_cache is not None:
+                lru_cached = self.line_cache.get(line, self.target_lang)
+                if lru_cached is not None:
+                    final_translations[idx] = lru_cached
+                    cache_hits += 1
+                    continue
+
+            # 2. Reuse existing on-screen block translation if this line is already on screen (old data)
             reused_prev = None
             for pb in self.prev_blocks:
                 pb_raw = pb.get("raw_line", "")
@@ -1382,23 +1567,31 @@ class TranslationWorker(QThread):
                     break
             if reused_prev is not None:
                 final_translations[idx] = reused_prev
+                if self.line_cache is not None:
+                    self.line_cache.put(line, reused_prev, self.target_lang)
                 cache_hits += 1
                 continue
 
-            # 2. Check persistent Cache / Codex / 133K Dictionary
+            # 3. Check persistent Cache / Codex / 133K Dictionary
             cached = self.knowledge_mgr.lookup_cached_translation(line, self.target_lang) if self.knowledge_mgr else None
             if cached is not None:
                 final_translations[idx] = cached
+                if self.line_cache is not None:
+                    self.line_cache.put(line, cached, self.target_lang)
                 cache_hits += 1
+                newly_seen_indices.append(idx)
             else:
                 missing_indices.append(idx)
                 missing_lines.append(line)
+                newly_seen_indices.append(idx)
 
         if missing_lines:
             newly_translated = self.translate_batch_with_context(missing_lines)
             for i, orig_idx in enumerate(missing_indices):
                 trans = newly_translated[i] if i < len(newly_translated) else missing_lines[i]
                 final_translations[orig_idx] = trans
+                if self.line_cache is not None:
+                    self.line_cache.put(missing_lines[i], trans, self.target_lang)
 
             if self.knowledge_mgr:
                 self.knowledge_mgr.store_cached_translations(
@@ -1406,6 +1599,13 @@ class TranslationWorker(QThread):
                     [final_translations[i] for i in missing_indices],
                     self.target_lang
                 )
+
+        seen_set = set(newly_seen_indices)
+        self.new_chat_messages = [
+            (text_lines[i], final_translations[i])
+            for i in range(len(text_lines))
+            if i in seen_set and final_translations[i] is not None
+        ]
 
         if self.knowledge_mgr:
             self.knowledge_mgr.record_dialogue(text_lines, final_translations)
@@ -1663,6 +1863,7 @@ class FloatingOverlayHUD(QWidget):
         self.drag_offset = None
         self.dpr = 1.0
         self.overlay_style = "replace"  # "replace" (In-Place Chameleon), "transparent" (Halo Text Only), "glass" (Translucent Pill)
+        self.stream_mode_only = False   # True when Live Chat Stream Only mode hides HUD pills
         self.font_family = "Segoe UI"
         self.font_size = 13
         self.font_bold = True
@@ -1689,6 +1890,48 @@ class FloatingOverlayHUD(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setGeometry(350, 280, 560, 220)
         self.setMouseTracking(True)
+
+    def _compute_non_overlapping_layout(self, w: int, h: int, blocks=None) -> list:
+        """
+        Anti-Overlap Collision Engine (v2.0):
+        Sort blocks top-to-bottom by Y coordinate and strictly clamp each block's max_h
+        so box[i].bottom <= box[i+1].top - 2px, preventing overlapping background pills.
+        """
+        src_blocks = self.blocks if blocks is None else blocks
+        if not src_blocks:
+            return []
+
+        dpr = max(0.5, float(self.dpr or 1.0))
+        items = []
+        for blk in src_blocks:
+            rx, ry, rw, rh = blk.get('rect', (0, 0, 100, 24))
+            lx = max(0, int(rx / dpr))
+            ly = max(0, int(ry / dpr))
+            orig_lw = max(int(rw / dpr), 28)
+            orig_lh = max(int(rh / dpr), 16)
+            items.append({
+                'block': blk,
+                'x': lx,
+                'y': ly,
+                'w': orig_lw,
+                'h': orig_lh,
+                'max_w': max(orig_lw + 60, int(w) - lx - 6),
+                'max_h': max(6, int(h) - ly - 4),
+            })
+
+        items.sort(key=lambda it: (it['y'], it['x']))
+
+        n = len(items)
+        for i in range(n):
+            cur = items[i]
+            for j in range(i + 1, n):
+                nxt = items[j]
+                if nxt['y'] - cur['y'] > 8:
+                    allowed_h = (nxt['y'] - 2) - cur['y']
+                    cur['max_h'] = max(6, min(cur['max_h'], allowed_h))
+                    break
+
+        return items
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1819,7 +2062,6 @@ class FloatingOverlayHUD(QWidget):
         if self.is_capturing or self.is_hidden_by_user:
             return
 
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.TextAntialiasing)
@@ -1827,13 +2069,32 @@ class FloatingOverlayHUD(QWidget):
         w, h = self.width(), self.height()
 
         if not self.is_locked and not self.is_fullscreen:
-            pen = QPen(QColor(99, 102, 241, 175), 1.5, Qt.DashLine)
+            if self.stream_mode_only:
+                pen = QPen(QColor(16, 185, 129, 200), 2.0, Qt.DashLine)
+                grip_color = QColor(52, 211, 153, 240)
+            else:
+                pen = QPen(QColor(99, 102, 241, 175), 1.5, Qt.DashLine)
+                grip_color = QColor(129, 140, 248, 235)
+
             painter.setPen(pen)
             # Alpha=1 keeps the interior 99.6% transparent while still catching mouse drag events on Windows
             painter.setBrush(QBrush(QColor(0, 0, 0, 1)))
             painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
 
-            if not self.blocks:
+            if self.stream_mode_only:
+                badge_rect = QRectF(8, 8, min(365, max(80, w - 16)), 24)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(6, 78, 59, 190)))
+                painter.drawRoundedRect(badge_rect, 6, 6)
+
+                painter.setPen(QColor(167, 243, 208))
+                painter.setFont(QFont("Segoe UI", 8, QFont.DemiBold))
+                painter.drawText(
+                    badge_rect.adjusted(10, 0, -6, 0),
+                    Qt.AlignVCenter | Qt.AlignLeft,
+                    "🟢 LIVE CHAT SENSOR  •  F8: Quét  •  F9: Dịch  •  F10: Khóa"
+                )
+            elif not self.blocks:
                 badge_rect = QRectF(8, 8, min(295, max(80, w - 16)), 24)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(15, 23, 42, 175)))
@@ -1878,29 +2139,34 @@ class FloatingOverlayHUD(QWidget):
             grip_path.moveTo(w - 2, my - el)
             grip_path.lineTo(w - 2, my + el)
 
-            painter.setPen(QPen(QColor(129, 140, 248, 235), 2.5, Qt.SolidLine, Qt.RoundCap))
+            painter.setPen(QPen(grip_color, 2.5, Qt.SolidLine, Qt.RoundCap))
             painter.drawPath(grip_path)
+
+        # Dual Display Mode: skip drawing overlay translation pills when Live Chat Stream Only is active
+        if self.stream_mode_only:
+            return
 
         weight = QFont.Bold if self.font_bold else QFont.Normal
         base_pt = max(6, min(48, int(self.font_size)))
         mask_alpha = max(0, min(255, int(self.bg_opacity * 255 / 100)))
 
-        # Sort blocks top-to-bottom so multi-line chat boxes never overlap or paint backgrounds over text
+        # Compute strict non-overlapping top-to-bottom layout slots
         eased = self._anim_eased()
         render_plan = []
         layout_groups = (
-            (sorted(self.blocks, key=lambda item: (item['rect'][1], item['rect'][0])), False),
-            (sorted(self.fading_blocks, key=lambda item: (item['rect'][1], item['rect'][0])), True),
+            (self._compute_non_overlapping_layout(w, h, self.blocks), False),
+            (self._compute_non_overlapping_layout(w, h, self.fading_blocks), True),
         )
 
-        for sorted_blocks, is_fading in layout_groups:
-          n_blocks = len(sorted_blocks)
-          for idx, b in enumerate(sorted_blocks):
-            rx, ry, rw, rh = b['rect']
-            lx = int(rx / self.dpr)
-            ly = int(ry / self.dpr)
-            orig_lw = max(int(rw / self.dpr), 28)
-            orig_lh = max(int(rh / self.dpr), 16)
+        for layout_items, is_fading in layout_groups:
+          for layout in layout_items:
+            b = layout['block']
+            lx = layout['x']
+            ly = layout['y']
+            orig_lw = layout['w']
+            orig_lh = layout['h']
+            max_avail_w = layout['max_w']
+            max_h = layout['max_h']
 
             text = b['text']
             bg_rgb = b.get('bg_color', (15, 23, 42))
@@ -1915,54 +2181,39 @@ class FloatingOverlayHUD(QWidget):
                 a0 = float(b.get('_anim_alpha0', 1.0))
                 anim_alpha = a0 + (1.0 - a0) * eased
 
-            # Check vertical slot before the next chat line below this block
-            next_ly = None
-            for j in range(idx + 1, n_blocks):
-                nrx, nry, nrw, _ = sorted_blocks[j]['rect']
-                nlx = int(nrx / self.dpr)
-                nly = int(nry / self.dpr)
-                if nly > ly + 4 and abs(nlx - lx) < max(orig_lw, int(nrw / self.dpr), 180):
-                    next_ly = nly
-                    break
-
-            slot_h = (next_ly - ly - 1) if next_ly is not None else max(orig_lh + 36, base_pt * 4)
-            slot_h = max(14, slot_h)
-
+            # Auto-shrink font loop (from base_pt through 11pt -> 8pt) so long text fits inside max_h
             target_font_size = base_pt
-            max_avail_w = max(orig_lw + 60, w - lx - 6)
             font = QFont(self.font_family, target_font_size, weight)
             fm = QFontMetrics(font)
 
-            if self.auto_font_fit or (next_ly is not None and slot_h <= 32):
-                min_shrink_pt = max(7, base_pt - 5)
+            if self.auto_font_fit or max_h < orig_lh + 18:
+                min_shrink_pt = min(8, base_pt)
                 while target_font_size > min_shrink_pt:
                     t_rect = fm.boundingRect(
-                        QRect(lx, ly, max_avail_w, max(orig_lh + 36, target_font_size * 4)),
+                        QRect(lx, ly, max_avail_w, max(max_h * 4, target_font_size * 5)),
                         Qt.TextWordWrap,
                         text
                     )
-                    if t_rect.height() <= slot_h and fm.horizontalAdvance(text) <= max_avail_w * 1.25:
+                    if t_rect.height() + 2 <= max_h:
                         break
                     target_font_size -= 1
                     font = QFont(self.font_family, target_font_size, weight)
                     fm = QFontMetrics(font)
 
             text_rect = fm.boundingRect(
-                QRect(lx, ly, max_avail_w, max(orig_lh + 36, target_font_size * 4)),
+                QRect(lx, ly, max_avail_w, max(max_h * 4, target_font_size * 5)),
                 Qt.TextWordWrap,
                 text
             )
-            draw_w = max(orig_lw, min(text_rect.width() + 12, w - lx - 2))
-            draw_h = max(orig_lh, text_rect.height() + 2)
-            if next_ly is not None and ly + draw_h > next_ly:
-                draw_h = max(14, next_ly - ly)
+            draw_w = max(orig_lw, min(text_rect.width() + 12, max(orig_lw, w - lx - 2)))
+            draw_h = min(max_h, max(min(orig_lh, max_h), text_rect.height() + 2))
 
             if not is_fading:
                 b['painted_phys_rect'] = (
                     max(0, int((lx - 2) * self.dpr)),
-                    max(0, int((ly - 1) * self.dpr)),
+                    max(0, int(ly * self.dpr)),
                     int((draw_w + 4) * self.dpr),
-                    int((draw_h + 2) * self.dpr)
+                    int(draw_h * self.dpr)
                 )
             render_plan.append({
                 'block': b,
@@ -1999,25 +2250,28 @@ class FloatingOverlayHUD(QWidget):
                     painter.setOpacity(1.0)
                     painter.setBrush(QBrush(QColor(bg_rgb[0], bg_rgb[1], bg_rgb[2], mask_alpha)))
                     painter.drawRoundedRect(
-                        QRectF(lx - 2, ly - 1, max(orig_lw, draw_w) + 4, max(orig_lh, draw_h) + 1),
+                        QRectF(lx - 2, ly, max(orig_lw, draw_w) + 4, draw_h),
                         3, 3
                     )
                     for wm in b.get('word_masks', []):
                         wx, wy, ww, wh = wm['rect']
+                        wy_l = max(ly, int(wy / self.dpr))
+                        max_wm_h = max(4, (ly + draw_h) - wy_l)
+                        wm_h = min(max_wm_h, max(4, int(wh / self.dpr)))
                         w_bg = wm.get('bg_color', bg_rgb)
                         painter.setBrush(QBrush(QColor(w_bg[0], w_bg[1], w_bg[2], mask_alpha)))
                         painter.drawRoundedRect(
                             QRectF(
                                 int(wx / self.dpr) - 2,
-                                int(wy / self.dpr) - 1,
+                                wy_l,
                                 max(4, int(ww / self.dpr) + 4),
-                                max(4, int(wh / self.dpr) + 2)
+                                wm_h
                             ),
                             2, 2
                         )
                 elif self.overlay_style == "glass":
                     painter.setOpacity(item['alpha'])
-                    bg_rect = QRectF(lx - 3, ly - 1 + item['dy'], draw_w + 6, draw_h + 1)
+                    bg_rect = QRectF(lx - 3, ly + item['dy'], draw_w + 6, draw_h)
                     painter.setBrush(QBrush(QColor(11, 15, 25, mask_alpha)))
                     painter.drawRoundedRect(bg_rect, 4, 4)
             painter.setOpacity(1.0)
@@ -2034,7 +2288,7 @@ class FloatingOverlayHUD(QWidget):
             )
             self._draw_outlined_text(
                 painter,
-                QRectF(item['lx'], item['ly'] - 1 + item['dy'], item['draw_w'], item['draw_h'] + 2),
+                QRectF(item['lx'], item['ly'] + item['dy'], item['draw_w'], item['draw_h']),
                 Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
                 item['text'],
                 fg_qcolor,
@@ -2707,6 +2961,7 @@ class MainStudioWindow(QWidget):
 
         self.worker = None
         self.update_worker = None
+        self.line_cache = LineTranslationCache(capacity=600)
         self.last_raw_text = ""
         self.last_valid_blocks = []
         self.last_frame_sig = None
@@ -2737,7 +2992,11 @@ class MainStudioWindow(QWidget):
         self._apply_stylesheet()
         self._build_ui()
         self.adjustSize()
-        self.setFixedSize(self.sizeHint().width(), self.sizeHint().height())
+        screen = QApplication.primaryScreen()
+        avail_h = (screen.availableGeometry().height() - 40) if screen else 860
+        hint = self.sizeHint()
+        self.setMinimumWidth(max(540, hint.width()))
+        self.resize(max(560, hint.width()), min(hint.height(), max(520, avail_h)))
         self.load_config()
         self._register_global_hotkeys()
         self.scene_watch_timer.start()
@@ -2874,6 +3133,15 @@ class MainStudioWindow(QWidget):
                 font-family: 'Consolas', monospace;
                 font-size: 11px;
             }
+            QTextEdit#ChatFeed {
+                background-color: #0B1120;
+                border: 1px solid #1E293B;
+                border-radius: 6px;
+                padding: 8px;
+                color: #E2E8F0;
+                font-family: 'Segoe UI', 'Consolas', sans-serif;
+                font-size: 12px;
+            }
         """)
 
     def _build_ui(self):
@@ -2946,6 +3214,7 @@ class MainStudioWindow(QWidget):
         self.cb_dst.setView(QListView())
         self.cb_dst.setFixedHeight(36)
         self.cb_dst.addItems(["Vietnamese", "English", "Japanese", "Korean", "French"])
+        self.cb_dst.currentIndexChanged.connect(self._on_translation_settings_changed)
         col_dst.addWidget(lbl_d)
         col_dst.addWidget(self.cb_dst)
 
@@ -2982,9 +3251,12 @@ class MainStudioWindow(QWidget):
         col_mode.addLayout(row_mode)
         c1_layout.addLayout(col_mode)
 
+        row_display = QHBoxLayout()
+        row_display.setSpacing(10)
+
         col_style = QVBoxLayout()
         col_style.setSpacing(6)
-        lbl_style_mode = QLabel("Overlay Style (Kiểu hiển thị chữ dịch trên hình):")
+        lbl_style_mode = QLabel("Overlay Style (Kiểu nền/chữ):")
         lbl_style_mode.setObjectName("FieldLabel")
         self.cb_overlay_style = QComboBox()
         self.cb_overlay_style.setView(QListView())
@@ -2997,7 +3269,28 @@ class MainStudioWindow(QWidget):
         self.cb_overlay_style.currentIndexChanged.connect(self.on_overlay_style_changed)
         col_style.addWidget(lbl_style_mode)
         col_style.addWidget(self.cb_overlay_style)
-        c1_layout.addLayout(col_style)
+
+        col_disp = QVBoxLayout()
+        col_disp.setSpacing(6)
+        lbl_disp_mode = QLabel("Display Mode (Kiểu hiển thị v2.0):")
+        lbl_disp_mode.setObjectName("FieldLabel")
+        self.cb_display_mode = QComboBox()
+        self.cb_display_mode.setView(QListView())
+        self.cb_display_mode.setFixedHeight(36)
+        self.cb_display_mode.addItems([
+            "🟣 In-Place Overlay (Đè chữ trực tiếp lên HUD)",
+            "🟢 Live Chat Stream Only (Chỉ Feed 0ms - Không đè chữ)"
+        ])
+        self.cb_display_mode.setToolTip(
+            "Chọn 'Live Chat Stream Only' để quét 0ms không nháy hình và đọc bản dịch mượt trong Live Chat Stream Log bên dưới"
+        )
+        self.cb_display_mode.currentIndexChanged.connect(self.on_display_mode_changed)
+        col_disp.addWidget(lbl_disp_mode)
+        col_disp.addWidget(self.cb_display_mode)
+
+        row_display.addLayout(col_style, 1)
+        row_display.addLayout(col_disp, 1)
+        c1_layout.addLayout(row_display)
 
         # Typography & Appearance Suite (Font Family, Font Size, Text Color, Background Opacity, Bold, Auto-fit)
         row_typo1 = QHBoxLayout()
@@ -3114,10 +3407,19 @@ class MainStudioWindow(QWidget):
             "Tự động xóa ngay chữ dịch cũ trên màn hình khi bạn chuyển Tab, cuộn trang hoặc đổi cửa sổ để không bị rối mắt"
         )
 
+        self.chk_after_arrow = QCheckBox("⏭️ Chỉ dịch sau '>>' (MC)")
+        self.chk_after_arrow.setChecked(True)
+        self.chk_after_arrow.setToolTip(
+            "Bỏ qua phần Tên & Rank phía trước dấu '>>' (hoặc '»') trong khung chat Minecraft, chỉ dịch nội dung chat phía sau"
+        )
+        self.chk_after_arrow.stateChanged.connect(self._on_translation_settings_changed)
+
         row_auto.addWidget(self.chk_auto)
         row_auto.addWidget(self.sp_interval)
-        row_auto.addSpacing(10)
+        row_auto.addSpacing(8)
         row_auto.addWidget(self.chk_auto_clear)
+        row_auto.addSpacing(8)
+        row_auto.addWidget(self.chk_after_arrow)
         row_auto.addStretch()
         c1_layout.addLayout(row_auto)
 
@@ -3171,6 +3473,27 @@ class MainStudioWindow(QWidget):
         c2_layout.addLayout(col_k)
 
         root.addWidget(card_ai)
+
+        card_feed = QFrame()
+        self.card_feed = card_feed
+        card_feed.setObjectName("Card")
+        c3_layout = QVBoxLayout(card_feed)
+        c3_layout.setContentsMargins(16, 12, 16, 14)
+        c3_layout.setSpacing(8)
+
+        lbl_sec3 = QLabel("LIVE CHAT STREAM LOG (AUTO-SCROLL)")
+        lbl_sec3.setObjectName("SectionLabel")
+        c3_layout.addWidget(lbl_sec3)
+
+        self.txt_chat_feed = QTextEdit()
+        self.txt_chat_feed.setObjectName("ChatFeed")
+        self.txt_chat_feed.setReadOnly(True)
+        self.txt_chat_feed.document().setMaximumBlockCount(300)
+        self.txt_chat_feed.setPlaceholderText("Kênh dịch Chat trực tiếp (mỗi dòng mới sẽ tự động cuộn xuống đây)...")
+        self.txt_chat_feed.setFixedHeight(110)
+        c3_layout.addWidget(self.txt_chat_feed)
+
+        root.addWidget(card_feed)
 
         row_btns = QHBoxLayout()
         row_btns.setSpacing(8)
@@ -3239,6 +3562,57 @@ class MainStudioWindow(QWidget):
         style_map = {0: "replace", 1: "transparent", 2: "glass"}
         self.overlay_hud.overlay_style = style_map.get(index, "replace")
         self.overlay_hud.update()
+
+    def on_display_mode_changed(self, index: int):
+        stream_only = (index == 1)
+        self.overlay_hud.stream_mode_only = stream_only
+        if stream_only:
+            self.overlay_hud.is_capturing = False
+            self.lbl_status.setText("🟢 Live Chat Stream Only: Quét 0ms không nháy • Đọc log bên dưới")
+        else:
+            self.lbl_status.setText("🟣 In-Place Overlay: Dịch và hiển thị chữ đè trực tiếp trên HUD")
+        if hasattr(self, "card_feed") and self.is_compact_gaming_mode:
+            if stream_only:
+                self.card_feed.show()
+            else:
+                self.card_feed.hide()
+            self.adjustSize()
+        self.overlay_hud.update()
+
+    def _on_translation_settings_changed(self, *args):
+        if hasattr(self, "line_cache") and self.line_cache is not None:
+            self.line_cache.clear()
+        self.last_raw_text = ""
+        self.last_frame_sig = None
+
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _on_new_chat_messages(self, pairs):
+        if not pairs or not hasattr(self, "txt_chat_feed"):
+            return
+        ts = time.strftime("%H:%M:%S")
+        for orig_text, trans_text in pairs:
+            safe_orig = self._escape_html(orig_text)
+            safe_trans = self._escape_html(trans_text)
+            html_line = (
+                f"<div style='margin-bottom:4px;'>"
+                f"<span style='color:#64748B;'>[{ts}]</span> "
+                f"<span style='color:#94A3B8;'>{safe_orig}</span> "
+                f"<span style='color:#6366F1;'>&#8594;</span> "
+                f"<span style='color:#34D399; font-weight:600;'>{safe_trans}</span>"
+                f"</div>"
+            )
+            self.txt_chat_feed.append(html_line)
+        sb = self.txt_chat_feed.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
 
     @staticmethod
     def _extract_color_mode_from_text(label_text: str) -> str:
@@ -3386,6 +3760,12 @@ class MainStudioWindow(QWidget):
             if "auto_clear_on_change" in cfg and isinstance(cfg["auto_clear_on_change"], bool):
                 self.chk_auto_clear.setChecked(cfg["auto_clear_on_change"])
 
+            if "only_after_arrow" in cfg and isinstance(cfg["only_after_arrow"], bool):
+                self.chk_after_arrow.setChecked(cfg["only_after_arrow"])
+
+            display_mode = cfg.get("display_mode", "overlay")
+            self.cb_display_mode.setCurrentIndex(1 if display_mode == "stream" else 0)
+
             self.on_typography_changed()
 
             if "update_url" in cfg and isinstance(cfg["update_url"], str):
@@ -3408,7 +3788,9 @@ class MainStudioWindow(QWidget):
             "dst_lang": self.cb_dst.currentText(),
             "auto_interval": self.sp_interval.value(),
             "auto_clear_on_change": self.chk_auto_clear.isChecked(),
+            "only_after_arrow": self.chk_after_arrow.isChecked(),
             "capture_mode": "fullscreen" if self.cb_mode.currentIndex() == 1 else "region",
+            "display_mode": "stream" if self.cb_display_mode.currentIndex() == 1 else "overlay",
             "overlay_style": style_map.get(self.cb_overlay_style.currentIndex(), "replace"),
             "font_family": self.cb_font_family.currentText(),
             "font_size": self.sp_font_size.value(),
@@ -3593,6 +3975,10 @@ class MainStudioWindow(QWidget):
         if self.is_compact_gaming_mode:
             self.card_lang.hide()
             self.card_ai.hide()
+            if self.overlay_hud.stream_mode_only:
+                self.card_feed.show()
+            else:
+                self.card_feed.hide()
             if not self.overlay_hud.is_locked:
                 self.overlay_hud.set_locked(True)
                 self.btn_lock.setText("🔒 Locked (F10)")
@@ -3602,12 +3988,16 @@ class MainStudioWindow(QWidget):
         else:
             self.card_lang.show()
             self.card_ai.show()
+            self.card_feed.show()
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
             self.btn_gaming_mode.setText("🎮 Chế độ Game")
             self.lbl_status.setText("Ready • F7: Ẩn/Hiện • F8: Chọn khung • F9: Dịch • F10: Khóa")
         self.show()
         self.adjustSize()
-        self.setFixedSize(self.sizeHint().width(), self.sizeHint().height())
+        screen = QApplication.primaryScreen()
+        avail_h = (screen.availableGeometry().height() - 40) if screen else 860
+        hint = self.sizeHint()
+        self.resize(max(540, hint.width()), min(hint.height(), max(220, avail_h)))
 
     def toggle_lock_mode(self):
         new_state = not self.overlay_hud.is_locked
@@ -3621,10 +4011,13 @@ class MainStudioWindow(QWidget):
 
     def clear_overlay_text(self):
         self.overlay_hud.blocks = []
+        self.overlay_hud.fading_blocks = []
         self.last_valid_blocks = []
         self.last_raw_text = ""
         self.last_frame_sig = None
         self.active_scene_sig = None
+        if hasattr(self, "line_cache") and self.line_cache is not None:
+            self.line_cache.clear()
         self.overlay_hud.update()
         self.lbl_status.setText("Cleared overlay translation blocks.")
 
@@ -3942,6 +4335,11 @@ class MainStudioWindow(QWidget):
         if self.worker and self.worker.isRunning():
             return
 
+        # Dual Display Mode: Live Chat Stream Only bypasses overlay hide + 45ms wait -> 0ms capture with zero flicker
+        if self.overlay_hud.stream_mode_only:
+            self._perform_screen_grab()
+            return
+
         # Phase 1: Hide overlay pills (and Studio window if Full Screen) so screen text is exposed cleanly
         self.overlay_hud.is_capturing = True
         if self.overlay_hud.is_fullscreen:
@@ -4030,9 +4428,12 @@ class MainStudioWindow(QWidget):
             last_raw_text=self.last_raw_text,
             knowledge_mgr=self.knowledge_mgr,
             src_selection_text=src_selection,
-            prev_blocks=self.last_valid_blocks
+            prev_blocks=self.last_valid_blocks,
+            only_after_arrow=self.chk_after_arrow.isChecked(),
+            line_cache=self.line_cache
         )
         self.worker.finished_signal.connect(self._on_translation_done)
+        self.worker.new_chat_signal.connect(self._on_new_chat_messages)
         self.worker.error_signal.connect(self._on_translation_error)
         self.worker.progress_signal.connect(self._on_translation_error)
         self.worker.start()
@@ -4045,8 +4446,12 @@ class MainStudioWindow(QWidget):
                 self.overlay_hud.repaint()
                 QTimer.singleShot(60, self._refresh_active_scene_signature)
         else:
-            # Smooth transition: old chat lines slide to their new positions, new lines fade in, gone lines fade out
-            self.overlay_hud.set_blocks_animated(blocks)
+            if self.overlay_hud.stream_mode_only:
+                self.overlay_hud.fading_blocks = []
+                self.overlay_hud.blocks = list(blocks)
+            else:
+                # Smooth transition: old chat lines slide to their new positions, new lines fade in, gone lines fade out
+                self.overlay_hud.set_blocks_animated(blocks)
             if blocks:
                 self.last_valid_blocks = list(blocks)
                 self.last_raw_text = blocks[0]['raw']

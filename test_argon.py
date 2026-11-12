@@ -802,6 +802,182 @@ class TestArgonOverlayTranslator(unittest.TestCase):
                 mock_start.assert_called_once()
             studio.close()
 
+    def test_minecraft_arrow_prefix_stripping(self):
+        """Verify Minecraft rank/player prefixes before '>>' or '»' are stripped while chat content is kept."""
+        row1 = [
+            {"text": "[VIP+]", "rect": (10, 20, 45, 16), "bg_color": (0, 0, 0)},
+            {"text": "Steve", "rect": (60, 20, 40, 16), "bg_color": (0, 0, 0)},
+            {"text": ">>", "rect": (105, 20, 16, 16), "bg_color": (0, 0, 0)},
+            {"text": "Drop", "rect": (128, 20, 34, 16), "bg_color": (0, 0, 0)},
+            {"text": "the", "rect": (168, 20, 26, 16), "bg_color": (0, 0, 0)},
+            {"text": "sword!", "rect": (200, 20, 48, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered = aot.filter_ocr_line_items(row1, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered]), "Drop the sword!")
+
+        row2 = [
+            {"text": "[MVP]", "rect": (10, 44, 45, 16), "bg_color": (0, 0, 0)},
+            {"text": "Alex»", "rect": (60, 44, 46, 16), "bg_color": (0, 0, 0)},
+            {"text": "Welcome", "rect": (114, 44, 60, 16), "bg_color": (0, 0, 0)},
+            {"text": "home", "rect": (180, 44, 40, 16), "bg_color": (0, 0, 0)},
+        ]
+        filtered2 = aot.filter_ocr_line_items(row2, strip_after_arrow=True)
+        self.assertEqual(aot.smart_join_ocr_tokens([it["text"] for it in filtered2]), "Welcome home")
+
+        # Worker end-to-end with Tesseract OCR payload including split '>' '>'
+        ocr_payload = {
+            "level": [5, 5, 5, 5, 5],
+            "block_num": [1, 1, 1, 1, 1],
+            "par_num": [1, 1, 1, 1, 1],
+            "line_num": [1, 1, 1, 1, 1],
+            "conf": ["95", "92", "88", "96", "94"],
+            "text": ["Steve", ">", ">", "Nice", "sword"],
+            "left": [10, 56, 66, 84, 126],
+            "top": [20, 20, 20, 20, 20],
+            "width": [42, 8, 8, 36, 44],
+            "height": [16, 16, 16, 16, 16],
+        }
+        img = Image.new("RGB", (260, 60), (15, 23, 42))
+        worker = aot.TranslationWorker(
+            pil_img=img, tess_lang="eng", target_lang="Vietnamese",
+            api_url="", api_key="", model_name="", last_raw_text="",
+            only_after_arrow=True,
+        )
+        emitted = []
+        worker.finished_signal.connect(lambda blocks, msg: emitted.append((blocks, msg)))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=ocr_payload), \
+             patch.object(worker, "translate_batch_with_context", return_value=["Thanh kiếm đẹp"]) as mock_tr:
+            worker.run()
+            mock_tr.assert_called_once_with(["Nice sword"])
+        self.assertEqual(emitted[0][0][0]["raw_line"], "Nice sword")
+        self.assertEqual(emitted[0][0][0]["text"], "Thanh kiếm đẹp")
+
+    def test_line_translation_cache_lru_and_scroll_reposition(self):
+        """Verify LineTranslationCache LRU eviction, 0ms scroll Y-remapping, and zero duplicate chat stream entries."""
+        cache = aot.LineTranslationCache(capacity=2)
+        cache.put("  Hello   world ", "Xin chào thế giới", "Vietnamese")
+        self.assertEqual(cache.get("hello world", "Vietnamese"), "Xin chào thế giới")
+        cache.put("Second line", "Dòng hai", "Vietnamese")
+        # Refresh "hello world" so "Second line" becomes oldest LRU
+        self.assertEqual(cache.get("hello world", "Vietnamese"), "Xin chào thế giới")
+        cache.put("Third line", "Dòng ba", "Vietnamese")
+        self.assertEqual(len(cache), 2)
+        self.assertIsNone(cache.get("Second line", "Vietnamese"))
+        self.assertEqual(cache.get("hello world", "Vietnamese"), "Xin chào thế giới")
+
+        # Worker scrolling test with LineTranslationCache
+        session_cache = aot.LineTranslationCache(capacity=100)
+        img = Image.new("RGB", (300, 180), (15, 23, 42))
+
+        frame1_ocr = {
+            "level": [5, 5], "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 2],
+            "conf": ["95", "95"], "text": ["Alpha", "Bravo"],
+            "left": [10, 10], "top": [100, 130], "width": [80, 80], "height": [18, 18],
+        }
+        w1 = aot.TranslationWorker(
+            pil_img=img, tess_lang="eng", target_lang="Vietnamese",
+            api_url="", api_key="", model_name="", last_raw_text="",
+            only_after_arrow=False, line_cache=session_cache,
+        )
+        out1, chat1 = [], []
+        w1.finished_signal.connect(lambda b, m: out1.append(b))
+        w1.new_chat_signal.connect(lambda pairs: chat1.extend(pairs))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=frame1_ocr), \
+             patch.object(w1, "translate_batch_with_context", return_value=["Dòng A", "Dòng B"]) as mock_tr:
+            w1.run()
+            mock_tr.assert_called_once_with(["Alpha", "Bravo"])
+        self.assertEqual(chat1, [("Alpha", "Dòng A"), ("Bravo", "Dòng B")])
+
+        # Frame 2: Chat scrolled upward -> Bravo moved from y=130 to y=100, Charlie appeared at y=130
+        frame2_ocr = {
+            "level": [5, 5], "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 2],
+            "conf": ["95", "95"], "text": ["Bravo", "Charlie"],
+            "left": [10, 10], "top": [100, 130], "width": [80, 90], "height": [18, 18],
+        }
+        w2 = aot.TranslationWorker(
+            pil_img=img, tess_lang="eng", target_lang="Vietnamese",
+            api_url="", api_key="", model_name="", last_raw_text="Alpha\nBravo",
+            prev_blocks=out1[0], only_after_arrow=False, line_cache=session_cache,
+        )
+        out2, chat2 = [], []
+        w2.finished_signal.connect(lambda b, m: out2.append(b))
+        w2.new_chat_signal.connect(lambda pairs: chat2.extend(pairs))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=frame2_ocr), \
+             patch.object(w2, "translate_batch_with_context", return_value=["Dòng C"]) as mock_tr2:
+            w2.run()
+            mock_tr2.assert_called_once_with(["Charlie"])  # Bravo hit LRU cache in 0ms!
+        self.assertEqual(out2[0][0]["text"], "Dòng B")
+        self.assertEqual(out2[0][0]["rect"][1], 100)  # Repinned to new Y coordinate
+        self.assertEqual(out2[0][1]["text"], "Dòng C")
+        self.assertEqual(out2[0][1]["rect"][1], 130)
+        self.assertEqual(chat2, [("Charlie", "Dòng C")])  # Bravo NOT duplicated in Live Stream
+
+    def test_anti_overlap_collision_engine_and_auto_shrink_paint(self):
+        """Verify _compute_non_overlapping_layout strictly enforces box[i].bottom <= box[i+1].top - 2px."""
+        hud = aot.FloatingOverlayHUD()
+        hud.resize(420, 220)
+        hud.dpr = 1.0
+        hud.font_size = 11
+        hud.auto_font_fit = True
+        hud.blocks = [
+            {"text": "Tin nhắn thứ hai rất dài " * 4, "rect": (12, 54, 240, 20), "bg_color": (10, 10, 10), "fg_color": (255, 255, 255)},
+            {"text": "Tin nhắn đầu tiên cực kỳ dài để kiểm tra tự động thu nhỏ cỡ chữ và chống đè nền", "rect": (12, 34, 240, 20), "bg_color": (10, 10, 10), "fg_color": (255, 255, 255)},
+        ]
+
+        layout = hud._compute_non_overlapping_layout(420, 220)
+        self.assertEqual(len(layout), 2)
+        self.assertLess(layout[0]["y"], layout[1]["y"])
+        self.assertLessEqual(layout[0]["y"] + layout[0]["max_h"], layout[1]["y"] - 2)
+
+        # Render full HUD paint cycle and inspect painted rectangles
+        hud.grab()
+        top_box = hud.blocks[1]["painted_phys_rect"]
+        bot_box = hud.blocks[0]["painted_phys_rect"]
+        self.assertLessEqual(top_box[1] + top_box[3], bot_box[1] - 2)
+        hud.close()
+
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_dual_display_mode_stream_only_and_chat_feed(self, mock_hotkey):
+        """Verify Dual Display Mode (cb_display_mode), 0ms bypass in Stream Only, and auto-scrolling ChatFeed."""
+        from PyQt5.QtWidgets import QListView
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        self.assertGreaterEqual(studio.cb_display_mode.height(), 36)
+        self.assertIsInstance(studio.cb_display_mode.view(), QListView)
+        self.assertEqual(studio.txt_chat_feed.objectName(), "ChatFeed")
+        self.assertTrue(studio.txt_chat_feed.isReadOnly())
+        self.assertFalse(studio.overlay_hud.stream_mode_only)
+
+        # Switch to Dual Mode 2: Live Chat Stream Only
+        studio.cb_display_mode.setCurrentIndex(1)
+        self.assertTrue(studio.overlay_hud.stream_mode_only)
+
+        # Must bypass 45ms hide delay and run _perform_screen_grab at 0ms
+        with patch.object(studio, "_perform_screen_grab") as mock_grab, \
+             patch("argon_overlay_translator.QTimer.singleShot") as mock_timer:
+            studio.initiate_capture_and_translate()
+            self.assertFalse(studio.overlay_hud.is_capturing)
+            mock_grab.assert_called_once()
+            mock_timer.assert_not_called()
+
+        # Verify HTML escaping & append into ChatFeed
+        studio._on_new_chat_messages([("<script>Bob & Co</script>", "Xin chào <mọi người>")])
+        feed_html = studio.txt_chat_feed.toHtml()
+        feed_plain = studio.txt_chat_feed.toPlainText()
+        self.assertIn("Bob & Co", feed_plain)
+        self.assertIn("Xin chào <mọi người>", feed_plain)
+        self.assertNotIn("<script>", feed_html)
+
+        # Verify persistence via config.json
+        studio.chk_after_arrow.setChecked(False)
+        studio.save_config()
+        studio.close()
+
+        studio2 = aot.MainStudioWindow(config_path=self.config_path)
+        self.assertEqual(studio2.cb_display_mode.currentIndex(), 1)
+        self.assertTrue(studio2.overlay_hud.stream_mode_only)
+        self.assertFalse(studio2.chk_after_arrow.isChecked())
+        studio2.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
