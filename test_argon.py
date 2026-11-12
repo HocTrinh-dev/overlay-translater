@@ -1115,8 +1115,140 @@ class TestArgonOverlayTranslator(unittest.TestCase):
             studio.close()
             mock_mss.return_value.close.assert_called_once()
 
+    @patch("argon_overlay_translator.keyboard.add_hotkey")
+    def test_ocr_preprocessing_clients5_session_and_context_grouping(self, mock_hotkey):
+        """Verify 2x BILINEAR+Contrast(1.8) OCR prep, global Session+clients5 batch, wrapped grouping & 3-line LLM context."""
+        from PIL import ImageDraw
+
+        # 1. OCR Preprocessing on dark 1200x650 screenshot: grayscale -> invert -> Contrast(1.8) -> 2x BILINEAR + /2 bbox scale
+        dark_img = Image.new("RGB", (1200, 650), (24, 28, 36))
+        ImageDraw.Draw(dark_img).rectangle([100, 100, 180, 118], fill=(195, 200, 210))
+        w_prep = aot.TranslationWorker(dark_img, "eng", "Vietnamese", "", "", "", "")
+        prep_img, scale = w_prep._prepare_ocr_image()
+        self.assertEqual(scale, 2)
+        self.assertEqual(prep_img.size, (2400, 1300))
+        self.assertEqual(prep_img.mode, "L")
+        # Inverted & contrasted dark background becomes bright white, light gray text becomes dark ink
+        self.assertGreater(prep_img.getpixel((10, 10)), 220)
+        self.assertLess(prep_img.getpixel((280, 218)), 80)
+
+        # Verify scaled OCR coordinates returned at scale=2 divide cleanly back down by 2
+        scaled_ocr = {
+            "level": [5, 5], "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 1],
+            "conf": ["95", "94"], "text": ["Hello", "world"],
+            "left": [200, 320], "top": [100, 100], "width": [80, 90], "height": [36, 36],
+        }
+        w_scale = aot.TranslationWorker(
+            dark_img, "eng", "Vietnamese", "", "", "", "", only_after_arrow=False, skip_color_sampling=True
+        )
+        blocks_out = []
+        w_scale.finished_signal.connect(lambda b, m: blocks_out.append(b))
+        with patch.object(w_scale, "_run_tesseract_ocr", return_value=(scaled_ocr, 2)), \
+             patch.object(w_scale, "translate_batch_with_context", return_value=["Xin chào thế giới"]):
+            w_scale.run()
+        self.assertEqual(blocks_out[0][0]["rect"], (100, 50, 105, 18))
+
+        # 2. Persistent global requests.Session() + high-speed clients5.google.com/translate_a/t batch endpoint
+        s1 = aot.get_http_session()
+        s2 = aot.get_http_session()
+        self.assertIs(s1, s2)
+        self.assertIsInstance(s1, aot.requests.Session)
+
+        mock_fast_resp = MagicMock()
+        mock_fast_resp.json.return_value = [["Chào bạn!", "en"], ["Thả kiếm xuống!", "en"]]
+        w_fast = aot.TranslationWorker(dark_img, "eng", "Vietnamese", "", "", "", "")
+        with patch.object(s1, "post", return_value=mock_fast_resp) as mock_sess_post:
+            res_fast = w_fast.translate_batch_with_context(["Hello friend!", "Drop sword!"])
+        self.assertEqual(res_fast, ["Chào bạn!", "Thả kiếm xuống!"])
+        mock_sess_post.assert_called_once()
+        called_url = mock_sess_post.call_args.args[0]
+        self.assertIn("clients5.google.com/translate_a/t", called_url)
+        self.assertIn("client=dict-chrome-ex", called_url)
+        self.assertEqual(mock_sess_post.call_args.kwargs["data"], [("q", "Hello friend!"), ("q", "Drop sword!")])
+
+        # 3. Smart Context Grouping merges wrapped adjacent lines while keeping separate player chat turns distinct
+        wrapped_ocr = {
+            "level": [5] * 12,
+            "block_num": [1] * 12,
+            "par_num": [1] * 12,
+            "line_num": [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+            "conf": ["95"] * 12,
+            "text": [
+                "Please", "bring", "the", "healing",
+                "potions", "before", "entering", "cave.",
+                "[VIP]", "Alex>>", "Thank", "you!",
+            ],
+            "left":   [20, 72, 118, 150, 20, 80, 130, 195, 20, 62, 118, 168],
+            "top":    [40, 40,  40,  40, 62, 62,  62,  62, 86, 86,  86,  86],
+            "width":  [48, 42,  28,  56, 56, 46,  60,  44, 38, 52,  46,  38],
+            "height": [18] * 12,
+        }
+        w_ctx = aot.TranslationWorker(
+            dark_img, "eng", "Vietnamese", "", "", "", "", only_after_arrow=True, skip_color_sampling=True
+        )
+        ctx_blocks = []
+        ctx_stream = []
+        w_ctx.finished_signal.connect(lambda b, m: ctx_blocks.append(b))
+        w_ctx.new_chat_signal.connect(lambda p: ctx_stream.extend(p))
+        with patch("argon_overlay_translator.pytesseract.image_to_data", return_value=wrapped_ocr), \
+             patch.object(
+                 w_ctx,
+                 "translate_batch_with_context",
+                 return_value=["Hãy mang bình hồi máu trước khi vào hang.", "Cảm ơn bạn!"],
+             ) as mock_ctx_batch:
+            w_ctx.run()
+
+        mock_ctx_batch.assert_called_once_with([
+            "Please bring the healing potions before entering cave.",
+            "Thank you!",
+        ])
+        self.assertEqual(len(ctx_blocks[0]), 3)
+        self.assertEqual(ctx_blocks[0][0]["text"] + " " + ctx_blocks[0][1]["text"], "Hãy mang bình hồi máu trước khi vào hang.")
+        self.assertEqual(ctx_blocks[0][2]["text"], "Cảm ơn bạn!")
+        self.assertEqual(len(ctx_stream), 2)
+
+        # 4. Last 3 previously translated lines passed as READ-ONLY context to OpenAI LLM system prompt
+        studio = aot.MainStudioWindow(config_path=self.config_path)
+        studio._on_translation_done(
+            [
+                {"raw": "a", "raw_line": "Line one?", "text": "Dòng một?", "rect": (0, 0, 10, 10)},
+                {"raw": "a", "raw_line": "Line two!", "text": "Dòng hai!", "rect": (0, 20, 10, 10)},
+                {"raw": "a", "raw_line": "Line three.", "text": "Dòng ba.", "rect": (0, 40, 10, 10)},
+                {"raw": "a", "raw_line": "Line four.", "text": "Dòng bốn.", "rect": (0, 60, 10, 10)},
+            ],
+            "OK",
+        )
+        self.assertEqual(len(studio.recent_translated_history), 3)
+        self.assertEqual(studio.recent_translated_history[0][0], "Line two!")
+
+        w_llm = aot.TranslationWorker(
+            dark_img,
+            "eng",
+            "Vietnamese",
+            "https://api.openai.com/v1/chat/completions",
+            "sk-mock",
+            "gpt-4o-mini",
+            "",
+            recent_context=studio.recent_translated_history,
+        )
+        mock_llm_resp = MagicMock()
+        mock_llm_resp.json.return_value = {"choices": [{"message": {"content": '["Dòng năm"]'}}]}
+        with patch("argon_overlay_translator.requests.post", return_value=mock_llm_resp) as mock_llm_post:
+            res_llm = w_llm.translate_batch_with_context(["Line five"])
+        self.assertEqual(res_llm, ["Dòng năm"])
+        sent = mock_llm_post.call_args.kwargs["json"]
+        sys_msg = sent["messages"][0]["content"]
+        self.assertIn("READ-ONLY", sys_msg)
+        self.assertNotIn("Line one?", sys_msg)
+        self.assertIn("Line two! => Dòng hai!", sys_msg)
+        self.assertIn("Line three. => Dòng ba.", sys_msg)
+        self.assertIn("Line four. => Dòng bốn.", sys_msg)
+        self.assertEqual(json.loads(sent["messages"][1]["content"]), ["Line five"])
+        studio.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 

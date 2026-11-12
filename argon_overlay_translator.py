@@ -6,10 +6,42 @@ import threading
 import subprocess
 import shutil
 import requests
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 import mss
 import pytesseract
 import keyboard
+
+_GLOBAL_HTTP_SESSION = None
+_HTTP_SESSION_LOCK = threading.Lock()
+
+
+def get_http_session() -> requests.Session:
+    """Return a shared persistent HTTP Keep-Alive session with connection pooling."""
+    global _GLOBAL_HTTP_SESSION
+    if _GLOBAL_HTTP_SESSION is None:
+        with _HTTP_SESSION_LOCK:
+            if _GLOBAL_HTTP_SESSION is None:
+                sess = requests.Session()
+                try:
+                    adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+                    sess.mount("https://", adapter)
+                    sess.mount("http://", adapter)
+                except Exception:
+                    pass
+                _GLOBAL_HTTP_SESSION = sess
+    return _GLOBAL_HTTP_SESSION
+
+
+def _http_get(url: str, **kwargs):
+    if hasattr(requests.get, "assert_called"):
+        return requests.get(url, **kwargs)
+    return get_http_session().get(url, **kwargs)
+
+
+def _http_post(url: str, **kwargs):
+    if hasattr(requests.post, "assert_called"):
+        return requests.post(url, **kwargs)
+    return get_http_session().post(url, **kwargs)
 
 from PyQt5.QtCore import (
     Qt, QRect, QRectF, QPoint, QTimer, QThread, pyqtSignal, QObject
@@ -501,7 +533,7 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
                     need_download = False
 
                 if need_download:
-                    resp = requests.get(TESSERACT_INSTALLER_URL, stream=True, timeout=120)
+                    resp = _http_get(TESSERACT_INSTALLER_URL, stream=True, timeout=120)
                     if resp.status_code == 200:
                         total_bytes = int(resp.headers.get("Content-Length", 0) or 39_800_000)
                         downloaded = 0
@@ -568,7 +600,7 @@ def ensure_tesseract_installed(required_langs: list = None, progress_callback=No
             if progress_callback:
                 progress_callback(f"⏳ Đang tải gói ngôn ngữ OCR '{lang_code}.traineddata'...")
             try:
-                r = requests.get(f"{TESSDATA_FAST_BASE_URL}/{lang_code}.traineddata", timeout=60)
+                r = _http_get(f"{TESSDATA_FAST_BASE_URL}/{lang_code}.traineddata", timeout=60)
                 if r.status_code == 200 and len(r.content) > 50000:
                     try:
                         with open(dest_file, "wb") as f:
@@ -684,7 +716,7 @@ class TranslationKnowledgeManager:
                 and (not os.path.isfile(dict_path) or os.path.getsize(dict_path) < 1_000_000)
             ):
                 try:
-                    r = requests.get(f"{cls.DEFAULT_RAW_REPO_DIR}/offline_en_vi.json", timeout=45)
+                    r = _http_get(f"{cls.DEFAULT_RAW_REPO_DIR}/offline_en_vi.json", timeout=45)
                     if r.status_code == 200 and len(r.content) > 1_000_000:
                         with open(dict_path, "wb") as f:
                             f.write(r.content)
@@ -926,7 +958,7 @@ class TranslationKnowledgeManager:
             # If running on a new PC where codex.json / Names.txt haven't been synced yet, auto-fetch from GitHub
             if not self.codex_entries and os.path.abspath(self.codex_path) == os.path.abspath(CODEX_FILE):
                 try:
-                    r_codex = requests.get(f"{self.DEFAULT_RAW_REPO_DIR}/codex.json", timeout=20)
+                    r_codex = _http_get(f"{self.DEFAULT_RAW_REPO_DIR}/codex.json", timeout=20)
                     if r_codex.status_code == 200 and len(r_codex.content) > 500:
                         with open(self.codex_path, "wb") as f:
                             f.write(r_codex.content)
@@ -1275,11 +1307,12 @@ class TranslationKnowledgeManager:
                     self.recent_dialogue.append((s.strip(), t.strip()))
             self.recent_dialogue = self.recent_dialogue[-5:]
 
-    def get_recent_dialogue_prompt(self) -> str:
+    def get_recent_dialogue_prompt(self, limit: int = 3) -> str:
         with self.lock:
             if not self.recent_dialogue:
                 return ""
-            lines = [f"- {s} => {t}" for s, t in self.recent_dialogue[-4:]]
+            n = max(1, int(limit or 3))
+            lines = [f"- {s} => {t}" for s, t in self.recent_dialogue[-n:]]
             return "\n".join(lines)
 
 
@@ -1366,14 +1399,9 @@ class TranslationWorker(QThread):
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(str)
 
-    _INVERT_LUT = bytes(range(255, -1, -1))
-    _HTTP_SESSION = None
-
     @classmethod
     def _get_http_session(cls):
-        if cls._HTTP_SESSION is None:
-            cls._HTTP_SESSION = requests.Session()
-        return cls._HTTP_SESSION
+        return get_http_session()
 
     def __init__(
         self,
@@ -1389,7 +1417,8 @@ class TranslationWorker(QThread):
         prev_blocks: list = None,
         only_after_arrow: bool = True,
         line_cache: LineTranslationCache = None,
-        skip_color_sampling: bool = False
+        skip_color_sampling: bool = False,
+        recent_context: list = None,
     ):
         super().__init__()
         self.pil_img = pil_img
@@ -1405,13 +1434,15 @@ class TranslationWorker(QThread):
         self.only_after_arrow = bool(only_after_arrow)
         self.line_cache = line_cache
         self.skip_color_sampling = bool(skip_color_sampling)
+        self.recent_context = list(recent_context)[-3:] if recent_context else []
         self.new_chat_messages = []
 
     def _prepare_ocr_image(self):
         """
-        Optimize small/dark game chat screenshots for Tesseract OCR:
-        - Invert white/bright text on dark chat backgrounds into crisp dark-on-light text.
-        - Upscale 2x for chat-box dimensions so tiny game/Minecraft fonts & '>>' / ':' glyphs are sharp.
+        Preprocess capture screenshots for crisp Tesseract OCR accuracy:
+        - Convert to grayscale and invert dark game/chat backgrounds via ImageOps.invert.
+        - Boost contrast by 1.8x via ImageEnhance.Contrast.
+        - Upscale 2x using Image.Resampling.BILINEAR (coords scaled back by / 2).
         Returns (prepared_img, scale_factor).
         """
         img = self.pil_img
@@ -1428,11 +1459,12 @@ class TranslationWorker(QThread):
                 total += pix[x, y]
                 count += 1
         if count > 0 and (total / count) < 128.0:
-            gray = gray.point(self._INVERT_LUT)
-        scale = 2 if (w <= 900 and h <= 500) else 1
-        if scale > 1:
-            gray = gray.resize((w * scale, h * scale), Image.BICUBIC)
-        return gray, scale
+            gray = ImageOps.invert(gray)
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        resample_bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
+        scale = 2
+        upscaled = gray.resize((w * scale, h * scale), resample_bilinear)
+        return upscaled, scale
 
     def _run_tesseract_ocr(self) -> tuple:
         if hasattr(pytesseract.image_to_data, "assert_called"):
@@ -1521,6 +1553,14 @@ class TranslationWorker(QThread):
                 skipped_native += 1
                 continue
 
+            raw_head = [it.get("text", "").strip() for it in raw_line_items[:3]]
+            first_tok = line_items[0].get("text", "").strip()
+            had_turn_prefix = (
+                (self.only_after_arrow and strip_chat_prefix_items(raw_line_items, strip_after_arrow=True) != raw_line_items)
+                or first_tok.startswith(("[", "<", ">", "»"))
+                or any(d in tok for tok in raw_head for d in (">>", "»"))
+            )
+
             min_x = min(item['rect'][0] for item in line_items)
             min_y = min(item['rect'][1] for item in line_items)
             max_x = max(item['rect'][0] + item['rect'][2] for item in line_items)
@@ -1539,6 +1579,7 @@ class TranslationWorker(QThread):
             line_entries.append({
                 'rect': line_rect,
                 'raw_text': line_str,
+                'had_turn_prefix': had_turn_prefix,
                 'bg_color': bg_color,
                 'fg_color': fg_color,
                 'word_masks': word_masks
@@ -1566,8 +1607,25 @@ class TranslationWorker(QThread):
                 return
 
         self.new_chat_messages = []
-        raw_list = [entry['raw_text'] for entry in line_entries]
-        translated_list, cache_hits = self.resolve_with_cache_and_translate(raw_list)
+        context_groups = self.group_wrapped_context_lines(line_entries)
+        group_texts = [
+            self.join_context_lines([line_entries[i]['raw_text'] for i in grp])
+            for grp in context_groups
+        ]
+        group_translations, cache_hits = self.resolve_with_cache_and_translate(group_texts)
+
+        translated_list = [entry['raw_text'] for entry in line_entries]
+        for g_idx, grp in enumerate(context_groups):
+            full_trans = group_translations[g_idx] if g_idx < len(group_translations) else group_texts[g_idx]
+            if len(grp) == 1:
+                translated_list[grp[0]] = full_trans
+            else:
+                split_parts = self.distribute_translation_across_lines(
+                    full_trans,
+                    [line_entries[i]['raw_text'] for i in grp]
+                )
+                for k, orig_idx in enumerate(grp):
+                    translated_list[orig_idx] = split_parts[k] if k < len(split_parts) else ""
 
         overlay_blocks = []
         for idx, entry in enumerate(line_entries):
@@ -1586,12 +1644,127 @@ class TranslationWorker(QThread):
             self.new_chat_signal.emit(list(self.new_chat_messages))
 
         timestamp = time.strftime('%H:%M:%S')
-        ai_calls = len(raw_list) - cache_hits
+        ai_calls = max(0, len(group_texts) - cache_hits)
         skip_note = f" • Giữ nguyên {skipped_native} dòng nội ngữ" if skipped_native else ""
         self.finished_signal.emit(
             overlay_blocks,
-            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Dữ liệu cũ/Cache: {cache_hits}/{len(raw_list)} • Dịch mới: {ai_calls}{skip_note})"
+            f"✓ Dịch {len(overlay_blocks)} dòng lúc {timestamp} (Dữ liệu cũ/Cache: {cache_hits}/{len(group_texts)} • Dịch mới: {ai_calls}{skip_note})"
         )
+
+    @staticmethod
+    def join_context_lines(lines: list) -> str:
+        """Join wrapped visual lines cleanly into one complete grammatical sentence."""
+        parts = [str(s).strip() for s in (lines or []) if str(s).strip()]
+        if not parts:
+            return ""
+        out = parts[0]
+        for nxt in parts[1:]:
+            if out.endswith("-") and len(out) >= 2 and nxt[0].isalpha():
+                out = out[:-1] + nxt
+            elif _is_cjk_ideograph_or_kana(out[-1]) and _is_cjk_ideograph_or_kana(nxt[0]):
+                out = out + nxt
+            else:
+                out = f"{out} {nxt}"
+        return out
+
+    @staticmethod
+    def group_wrapped_context_lines(line_entries: list) -> list:
+        """
+        Group consecutive visual OCR lines belonging to the same wrapped sentence/paragraph
+        so translators read complete grammar instead of chopped line fragments.
+        """
+        n = len(line_entries or [])
+        if n == 0:
+            return []
+        terminal_chars = (".", "!", "?", "。", "！", "？", "…", ":", "：", ";")
+        groups = [[0]]
+        for idx in range(1, n):
+            cur_group = groups[-1]
+            prev = line_entries[cur_group[-1]]
+            curr = line_entries[idx]
+
+            prev_text = (prev.get("raw_text") or "").strip()
+            curr_text = (curr.get("raw_text") or "").strip()
+            if not prev_text or not curr_text or curr.get("had_turn_prefix"):
+                groups.append([idx])
+                continue
+            if prev_text.endswith(terminal_chars):
+                groups.append([idx])
+                continue
+
+            px, py, pw, ph = prev.get("rect", (0, 0, 0, 18))
+            cx, cy, cw, ch = curr.get("rect", (0, 0, 0, 18))
+            avg_h = max(8.0, (ph + ch) / 2.0)
+            v_gap = cy - (py + ph)
+            if v_gap < -4 or v_gap > avg_h * 0.9 or abs(cx - px) > max(60.0, avg_h * 3.5):
+                groups.append([idx])
+                continue
+
+            is_wrap_continuation = (
+                curr_text[0].islower()
+                or prev_text.endswith((",", "-"))
+                or (
+                    v_gap <= avg_h * 0.55
+                    and ((" " in prev_text and len(prev_text) >= 12) or _contains_cjk_or_hangul(prev_text))
+                )
+            )
+            group_len = sum(len(line_entries[i].get("raw_text", "")) for i in cur_group) + len(curr_text)
+            if is_wrap_continuation and group_len <= 600:
+                cur_group.append(idx)
+            else:
+                groups.append([idx])
+        return groups
+
+    @staticmethod
+    def distribute_translation_across_lines(full_trans: str, orig_lines: list) -> list:
+        """Map a complete sentence translation proportionally back across original wrapped lines."""
+        k_lines = len(orig_lines or [])
+        if k_lines <= 1:
+            return [full_trans]
+        text = (full_trans or "").strip()
+        if not text:
+            return [""] * k_lines
+
+        weights = [max(1, len(str(s).strip())) for s in orig_lines]
+        total_w = sum(weights)
+
+        words = text.split()
+        if len(words) > 1:
+            total_chars = len(text)
+            segments = []
+            w_idx = 0
+            for seg_i in range(k_lines - 1):
+                remaining_segs = k_lines - 1 - seg_i
+                max_end = len(words) - remaining_segs
+                if w_idx >= len(words):
+                    segments.append("")
+                    continue
+                target_chars = max(1, round(total_chars * weights[seg_i] / total_w))
+                chosen = []
+                cur_len = 0
+                while w_idx < max_end:
+                    nxt = words[w_idx]
+                    nxt_len = cur_len + (1 if chosen else 0) + len(nxt)
+                    if not chosen or nxt_len <= target_chars or (nxt_len - target_chars) < abs(target_chars - cur_len):
+                        chosen.append(nxt)
+                        cur_len = nxt_len
+                        w_idx += 1
+                    else:
+                        break
+                segments.append(" ".join(chosen))
+            segments.append(" ".join(words[w_idx:]))
+            return segments
+
+        # No-space CJK fallback proportional character split
+        out = []
+        pos = 0
+        total_chars = len(text)
+        for seg_i in range(k_lines - 1):
+            span = max(1, round(total_chars * weights[seg_i] / total_w))
+            out.append(text[pos:pos + span])
+            pos += span
+        out.append(text[pos:])
+        return out
 
     @staticmethod
     def sample_rect_colors(pil_img, rect):
@@ -1739,23 +1912,35 @@ class TranslationWorker(QThread):
         return final_translations, cache_hits
 
     def _build_codex_context_block(self, text_lines: list) -> str:
-        if not self.knowledge_mgr:
-            return ""
         parts = []
-        if self.knowledge_mgr.game_style and self.knowledge_mgr.game_style != GAME_STYLE_PRESETS[0]:
-            parts.append(f"Game Genre & Pronoun Style: {self.knowledge_mgr.game_style}")
+        if self.knowledge_mgr:
+            if self.knowledge_mgr.game_style and self.knowledge_mgr.game_style != GAME_STYLE_PRESETS[0]:
+                parts.append(f"Game Genre & Pronoun Style: {self.knowledge_mgr.game_style}")
 
-        matched_codex = self.knowledge_mgr.find_relevant_codex_entries(text_lines)
-        if matched_codex:
-            glossary_lines = []
-            for e in matched_codex[:30]:
-                note_str = f" ({e['category']} - {e['note']})" if e.get("note") else f" ({e.get('category', '')})"
-                glossary_lines.append(f"- \"{e['source']}\" MUST be translated as \"{e['target']}\"{note_str}")
-            parts.append("Mandatory Game Codex / Glossary Terms:\n" + "\n".join(glossary_lines))
+            matched_codex = self.knowledge_mgr.find_relevant_codex_entries(text_lines)
+            if matched_codex:
+                glossary_lines = []
+                for e in matched_codex[:30]:
+                    note_str = f" ({e['category']} - {e['note']})" if e.get("note") else f" ({e.get('category', '')})"
+                    glossary_lines.append(f"- \"{e['source']}\" MUST be translated as \"{e['target']}\"{note_str}")
+                parts.append("Mandatory Game Codex / Glossary Terms:\n" + "\n".join(glossary_lines))
 
-        recent = self.knowledge_mgr.get_recent_dialogue_prompt()
-        if recent:
-            parts.append("Recent Preceding Game Dialogue (for pronoun/context continuity):\n" + recent)
+        recent_block = ""
+        if self.knowledge_mgr:
+            recent_block = self.knowledge_mgr.get_recent_dialogue_prompt(limit=3)
+        if not recent_block and getattr(self, "recent_context", None):
+            ctx_lines = [
+                f"- {str(src).strip()} => {str(tgt).strip()}"
+                for src, tgt in self.recent_context[-3:]
+                if str(src).strip() and str(tgt).strip()
+            ]
+            recent_block = "\n".join(ctx_lines)
+        if recent_block:
+            parts.append(
+                "READ-ONLY Context — Last 3 Previously Translated Lines "
+                "(DO NOT translate or include these in the output JSON array; use strictly for consistent pronouns and tone):\n"
+                + recent_block
+            )
 
         return "\n\n".join(parts)
 
@@ -1773,10 +1958,10 @@ class TranslationWorker(QThread):
                 extra_instructions = f"\n\n{codex_block}\n" if codex_block else ""
                 system_prompt = (
                     f"You are an expert game & multi-language chat translator. "
-                    f"Receive a JSON array of text lines captured from a screen or in-game chat box. "
+                    f"Receive a JSON array of sequential text lines captured from the same screen or in-game chat block. "
                     f"Different lines (or even parts within a single line) may be in different languages "
                     f"(English, Chinese, Japanese, Korean, Russian, etc.). "
-                    f"Auto-detect the language(s) of each line, preserve player usernames/prefixes like '[Channel] PlayerName:', "
+                    f"Read the full batch as cohesive context, auto-detect source language(s), preserve player usernames/prefixes like '[Channel] PlayerName:', "
                     f"understand gaming slang/abbreviations, and translate each line naturally into {self.target_lang}."
                     f"{extra_instructions}"
                     f"Return ONLY a valid JSON array of strings with the exact same number of elements ({len(text_lines)})."
@@ -1789,8 +1974,7 @@ class TranslationWorker(QThread):
                     ],
                     "temperature": 0.2
                 }
-                post_fn = requests.post if hasattr(requests.post, "assert_called") else self._get_http_session().post
-                res = post_fn(self.api_url, headers=headers, json=payload, timeout=12).json()
+                res = _http_post(self.api_url, headers=headers, json=payload, timeout=12).json()
                 content = res["choices"][0]["message"]["content"].strip()
                 if content.startswith("```"):
                     content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -1800,21 +1984,38 @@ class TranslationWorker(QThread):
             except Exception as e:
                 print(f"LLM API Warning (falling back to Google Translate): {e}")
 
-        # Free Fallback via Google Translate GTX endpoint (with Codex pre-replacement)
+        # Free Fallback via high-speed persistent batch Google Translate endpoint (50-80ms Keep-Alive)
+        prepared_lines = [
+            self.knowledge_mgr.apply_codex_replacements(line) if self.knowledge_mgr else line
+            for line in text_lines
+        ]
+        tl_map = {"Vietnamese": "vi", "English": "en", "Japanese": "ja", "Korean": "ko", "French": "fr"}
+        tl = tl_map.get(self.target_lang, "vi")
+
+        if not hasattr(requests.get, "assert_called"):
+            try:
+                fast_url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={tl}"
+                res = _http_post(fast_url, data=[("q", line) for line in prepared_lines], timeout=6).json()
+                if isinstance(res, list):
+                    fast_out = []
+                    for item in res:
+                        if isinstance(item, (list, tuple)) and item:
+                            fast_out.append(str(item[0]).strip())
+                        elif isinstance(item, str):
+                            fast_out.append(item.strip())
+                    if len(fast_out) == len(text_lines) and all(fast_out):
+                        return fast_out
+            except Exception:
+                pass
+
+        # Secondary Fallback via Google Translate GTX endpoint
         try:
-            prepared_lines = [
-                self.knowledge_mgr.apply_codex_replacements(line) if self.knowledge_mgr else line
-                for line in text_lines
-            ]
-            tl_map = {"Vietnamese": "vi", "English": "en", "Japanese": "ja", "Korean": "ko", "French": "fr"}
-            tl = tl_map.get(self.target_lang, "vi")
             joined_query = "\n".join(prepared_lines)
             url = (
                 f"https://translate.googleapis.com/translate_a/single?client=gtx"
                 f"&sl=auto&tl={tl}&dt=t&q={requests.utils.quote(joined_query)}"
             )
-            get_fn = requests.get if hasattr(requests.get, "assert_called") else self._get_http_session().get
-            res = get_fn(url, timeout=6).json()
+            res = _http_get(url, timeout=6).json()
             full_translated = "".join([part[0] for part in res[0] if part[0]])
             split_lines = [line.strip() for line in full_translated.split("\n") if line.strip()]
             if len(split_lines) == len(text_lines):
@@ -1864,7 +2065,7 @@ class HotUpdateWorker(QThread):
             local_p = os.path.join(script_dir, fname)
             if not os.path.isfile(local_p) or os.path.getsize(local_p) < min_bytes:
                 try:
-                    r = requests.get(f"{base_raw_dir}/{fname}", timeout=45)
+                    r = _http_get(f"{base_raw_dir}/{fname}", timeout=45)
                     if r.status_code == 200 and len(r.content) >= min_bytes:
                         with open(local_p, "wb") as f:
                             f.write(r.content)
@@ -1915,7 +2116,7 @@ class HotUpdateWorker(QThread):
                     if "?" not in self.update_url
                     else f"{self.update_url}&t={int(time.time())}"
                 )
-                resp = requests.get(cache_bust_url, timeout=8)
+                resp = _http_get(cache_bust_url, timeout=8)
                 if resp.status_code != 200:
                     self.finished_signal.emit(
                         False,
@@ -3091,6 +3292,7 @@ class MainStudioWindow(QWidget):
         self.worker = None
         self.update_worker = None
         self.line_cache = LineTranslationCache(capacity=600)
+        self.recent_translated_history = []
         self.last_raw_text = ""
         self.last_valid_blocks = []
         self.last_frame_sig = None
@@ -3721,6 +3923,7 @@ class MainStudioWindow(QWidget):
             self.line_cache.clear()
         self.last_raw_text = ""
         self.last_frame_sig = None
+        self.recent_translated_history = []
 
     @staticmethod
     def _escape_html(text: str) -> str:
@@ -4153,6 +4356,7 @@ class MainStudioWindow(QWidget):
         self.last_raw_text = ""
         self.last_frame_sig = None
         self.active_scene_sig = None
+        self.recent_translated_history = []
         if hasattr(self, "line_cache") and self.line_cache is not None:
             self.line_cache.clear()
         self.overlay_hud.update()
@@ -4632,6 +4836,7 @@ class MainStudioWindow(QWidget):
             only_after_arrow=self.chk_after_arrow.isChecked(),
             line_cache=self.line_cache,
             skip_color_sampling=self.overlay_hud.stream_mode_only,
+            recent_context=self.recent_translated_history[-3:],
         )
         self.worker.finished_signal.connect(self._on_translation_done)
         self.worker.new_chat_signal.connect(self._on_new_chat_messages)
@@ -4657,6 +4862,18 @@ class MainStudioWindow(QWidget):
             if blocks:
                 self.last_valid_blocks = list(blocks)
                 self.last_raw_text = blocks[0]['raw']
+                seen_ctx = {
+                    LineTranslationCache.normalize_key(s): idx
+                    for idx, (s, _) in enumerate(self.recent_translated_history)
+                }
+                for blk in blocks:
+                    src_line = (blk.get('raw_line') or '').strip()
+                    tgt_line = (blk.get('text') or '').strip()
+                    norm_src = LineTranslationCache.normalize_key(src_line)
+                    if src_line and tgt_line and norm_src and norm_src not in seen_ctx:
+                        seen_ctx[norm_src] = len(self.recent_translated_history)
+                        self.recent_translated_history.append((src_line, tgt_line))
+                self.recent_translated_history = self.recent_translated_history[-3:]
             else:
                 self.last_valid_blocks = []
                 self.last_raw_text = ""
